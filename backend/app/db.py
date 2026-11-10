@@ -28,9 +28,18 @@ CREATE TABLE IF NOT EXISTS project_events(id INTEGER PRIMARY KEY AUTOINCREMENT, 
 CREATE TABLE IF NOT EXISTS preferences(key TEXT PRIMARY KEY, value TEXT, count INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS match_feedback(id INTEGER PRIMARY KEY AUTOINCREMENT, descriptor TEXT, asset_id TEXT, accepted INTEGER, created REAL);
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS refs(key TEXT PRIMARY KEY, fingerprint TEXT, n_frames INTEGER, proxy_path TEXT,
+  validated INTEGER DEFAULT 0, created REAL);
 """
 
-JSON_COLS = {"error", "brief", "shots", "matches", "plan", "verifier", "analysis", "card", "data"}
+JSON_COLS = {"error", "brief", "shots", "matches", "plan", "verifier", "analysis", "card", "data", "template", "delta"}
+
+# CREATE TABLE IF NOT EXISTS does not add columns to an existing table
+MIGRATIONS = [
+    "ALTER TABLE templates ADD COLUMN template TEXT",
+    "ALTER TABLE templates ADD COLUMN delta TEXT",
+    "ALTER TABLE templates ADD COLUMN ir_version INTEGER",
+]
 
 
 def conn() -> sqlite3.Connection:
@@ -95,4 +104,14 @@ def kv_set(key: str, value: str) -> None:
     run("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", (key, value))
 
 
+def _migrate() -> None:
+    for sql in MIGRATIONS:
+        try:
+            conn().execute(sql)
+        except sqlite3.OperationalError:  # column already there
+            pass
+    conn().commit()
+
+
 conn().executescript(SCHEMA)
+_migrate()

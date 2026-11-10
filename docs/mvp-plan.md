@@ -384,15 +384,15 @@ Goal: the contracts and the instruments. No product behaviour changes.
 
 Read first: `app/models.py`, section 4 and section 5 of this file.
 
-- [ ] `app/ir.py`: the models and enums in section 4, plus `load(key, layer)` / `save(key, layer, model)` for `data/refs/<key>/ir/`, and `f2s`.
-- [ ] `app/db.py`: `refs` table, `templates` columns, `_migrate()`.
-- [ ] `tests/synth.py`: `SynthSpec`, `make_reel`, `marker_clip(slot_no, frames, out)`. First version supports: segments with cut frames, captions with position and frame range, one flash, one zoom, one `xfade` transition. Later milestones extend it.
-- [ ] `tools/score.py`: comparators shared with `stages/roundtrip.py`. Put the comparators in `app/stages/compare.py` so both import them:
+- [x] `app/ir.py`: the models and enums in section 4, plus `load(key, layer)` / `save(key, layer, model)` for `data/refs/<key>/ir/`, and `f2s`.
+- [x] `app/db.py`: `refs` table, `templates` columns, `_migrate()`.
+- [x] `tests/synth.py`: `SynthSpec`, `make_reel`, `marker_clip(slot_no, frames, out)`. First version supports: segments with cut frames, captions with position and frame range, one flash, one zoom, one `xfade` transition. Later milestones extend it.
+- [x] `tools/score.py`: comparators shared with `stages/roundtrip.py`. Put the comparators in `app/stages/compare.py` so both import them:
   - `match_events(pred, truth, tol_frames) -> (precision, recall, f1, mean_abs_err)` for point events (cuts, flashes).
   - `match_spans(pred, truth, min_iou)` for spans (transitions, text events, freezes).
   - `box_iou`, `text_similarity` (normalised edit distance; `difflib.SequenceMatcher` is enough).
-- [ ] `tools/label.py`: writes the draft label file and contact sheets. It can only prefill tracks that exist; it grows with each milestone.
-- [ ] `gold/README.md`: the label format and the labelling instructions.
+- [x] `tools/label.py`: writes the draft label file and contact sheets. It can only prefill tracks that exist; it grows with each milestone.
+- [x] `gold/README.md`: the label format and the labelling instructions.
 
 Done when: `tests/test_ir.py` round-trips every model through JSON; `tests/test_compare.py` covers each comparator with hand-made cases; `make_reel` produces a clip whose frame count and cut frames match its spec exactly (checked with `ff.count_frames` and a pixel probe at each cut).
 
@@ -645,6 +645,7 @@ Done when: the flow test covers analyse -> validate -> brief with a stubbed prov
 
 - 2026-11-11: plan written. Same-shot pass scoped to timing integrity only; cut correctness comes from the gold set and the marker pass.
 - 2026-11-11 M0: git repo created. OCR uses the RapidOCR fallback (PaddleOCR fails at inference on Windows). OpenCV is `opencv-contrib-python`, not headless, because mediapipe depends on it; the plan's dependency list is corrected. HyperFrames works with alpha, so M9 order stands. `ff.py` added with `fps()` and `video_stream()` beyond the listed helpers.
+- 2026-11-11 M1: `ir.py`, `compare.py`, `tests/synth.py`, `tools/score.py`, `tools/label.py`, `gold/README.md`. Synthetic reels draw frames in numpy/PIL and pipe them to ffmpeg instead of lavfi + drawtext + xfade, so every caption box, transition window and zoom scale is exact by construction; the product's xfade output is measured in the marker pass instead. `ir.save` stores `{v, inputs, data}` (model under `data`, because `Template` has its own `v`). `Template` gains `dropped` (evidence id -> reason) for coverage; `ir.s2f` added. `label.py` and `score.py` need M2's ingest and evidence to run.
 
 ---
 
