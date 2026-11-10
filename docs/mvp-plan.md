@@ -358,21 +358,21 @@ Goal: a repository, verified dependencies, and the two low-level helpers everyth
 
 Read first: `backend/requirements.txt`, `app/config.py`, `app/clients/video.py`, `tests/helpers.py`.
 
-- [ ] `git init`, first commit of the current tree. Add `gold/**/*.mp4`, `gold/**/*.mov` to `.gitignore`.
-- [ ] Install and import-check each new dependency in the venv, one at a time. Pin the installed version in `requirements.txt` only after the import works.
-  - `opencv-python-headless` (all OpenCV work)
+- [x] `git init`, first commit of the current tree. Add `gold/**/*.mp4`, `gold/**/*.mov` to `.gitignore`.
+- [x] Install and import-check each new dependency in the venv, one at a time. Pin the installed version in `requirements.txt` only after the import works.
+  - `opencv-contrib-python` (all OpenCV work; was `opencv-python-headless`, changed because mediapipe requires contrib, see section 8)
   - `scenedetect` (PySceneDetect; cuts)
   - `paddleocr` + `paddlepaddle` (PP-OCRv5; text). Fallback if it will not install or import: `rapidocr` + `onnxruntime`, which runs PP-OCR models. Record which one is in use.
   - `mediapipe` (person and face boxes). Fallback: OpenCV's bundled face detector. Subjects are a low-priority track.
   - `google-genai` (Gemini). No fallback needed; Pegasus is the second arm.
-- [ ] `app/clients/ff.py`:
+- [x] `app/clients/ff.py`:
   - `probe(path) -> dict` (ffprobe JSON: streams, `nb_frames` via `-count_frames`, `r_frame_rate`, duration).
   - `run(args: list[str]) -> None` (raises with the last stderr lines on failure).
   - `count_frames(path) -> int`, `ssim(a, b) -> list[float]` (per-frame, parsed from the `ssim` filter's stats file), `audio_lag(a, b) -> int` (samples; numpy cross-correlation on mono 8 kHz).
   - Use `clients.video._ensure_ffmpeg_on_path` so PATH handling stays in one place.
-- [ ] `config.py`: add `REFS = DATA / "refs"`, `KEEP_REFS = os.getenv("PVE_KEEP_REFS") == "1"`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `VLM_PROVIDER` (`gemini` or `pegasus`, default `pegasus` until a Gemini key is set). Add the new keys to `.env.example`.
-- [ ] Check the overlay engine: call `video.client().hyperframes_doctor()` and record the result. Then try the smallest possible `hyperframes_init` + `hyperframes_render` of a transparent text clip. Record in section 8 whether it works on this Windows machine and whether the output has an alpha channel. This decides M9.
-- [ ] Record the available xfade transitions: `ffmpeg -hide_banner -h filter=xfade`. Paste the list into section 8. `ir.TransitionType` maps onto this list in M6.
+- [x] `config.py`: add `REFS = DATA / "refs"`, `KEEP_REFS = os.getenv("PVE_KEEP_REFS") == "1"`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `VLM_PROVIDER` (`gemini` or `pegasus`, default `pegasus` until a Gemini key is set). Add the new keys to `.env.example`.
+- [x] Check the overlay engine: call `video.client().hyperframes_doctor()` and record the result. Then try the smallest possible `hyperframes_init` + `hyperframes_render` of a transparent text clip. Record in section 8 whether it works on this Windows machine and whether the output has an alpha channel. This decides M9.
+- [x] Record the available xfade transitions: `ffmpeg -hide_banner -h filter=xfade`. Paste the list into section 8. `ir.TransitionType` maps onto this list in M6.
 
 Done when: all imports succeed or have a recorded fallback; `tests/test_ff.py` passes (`probe`, `count_frames` and `ssim` on two generated clips; `audio_lag` returns 0 for a file against itself and the right lag for a shifted copy); section 8 is filled in.
 
@@ -632,18 +632,19 @@ Done when: the flow test covers analyse -> validate -> brief with a stubbed prov
 
 ## 8. Findings to record during M0 (fill in)
 
-- OCR package in use:
-- MediaPipe import on Python 3.12:
-- `hyperframes_doctor` result:
-- HyperFrames transparent output on Windows:
-- xfade transitions available in this FFmpeg build:
-- Gemini models visible to the key:
+- OCR package in use: **`rapidocr` 3.10.0 + `onnxruntime` 1.31.1** (PP-OCRv6 ONNX models, bundled). `paddleocr` 3.7.0 / `paddlepaddle` 3.3.1 installed and imported but failed at inference on Windows (`NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttribute<pir::DoubleAttribute>]`, oneDNN). It also downgraded numpy to 2.3.5; it was uninstalled and numpy restored to 2.5.4. RapidOCR read a 64 px white "HELLO REEL" on a 540x960 frame at score 0.9997, about 4.7 s cold start.
+- MediaPipe import on Python 3.12: **works**, `mediapipe` 1.2.2, `mediapipe.tasks.python.vision` imports. It requires `opencv-contrib-python`, so the project uses `opencv-contrib-python==5.0.0.93` instead of `opencv-python-headless` (two cv2 distributions in one venv overwrite each other). Task models (`.tflite`) are downloaded separately when the subjects track is built.
+- `hyperframes_doctor` result: core checks pass (hyperframes 0.8.209, Node v24.19.0, FFmpeg 9.0.2, system Chrome). `ok: false` only because optional items are missing: whisper-cpp, Kokoro TTS, MusicGen, Docker. The CLI is pinned in `overlay/hyperframes/package.json` (0.8.209, the newest release older than two weeks on 2026-11-11). `config.py` points `MCP_VIDEO_HYPERFRAMES_COMMAND` at it and sets `HYPERFRAMES_NO_TELEMETRY=1`, `DO_NOT_TRACK=1`.
+- HyperFrames transparent output on Windows: **works.** A blank portrait composition with `background: transparent` and a 0.5 s opacity tween, 2 s at 30 fps, rendered to exactly 60 frames in both formats. `--format webm`: VP9 `yuv420p` with `ALPHA_MODE=1` (decode with `-c:v libvpx-vp9` to get alpha); alpha plane 0 everywhere on frame 0, text at 255 on frame 30. `--format mov`: ProRes 4444 `yuva444p12le`. About 35 s per 2 s clip. Kinocut's render wrapper logs a harmless cp1252 `UnicodeDecodeError` from a reader thread; the render still succeeds. M9 keeps the order HyperFrames first.
+- xfade transitions available in this FFmpeg build: custom, fade, wipeleft, wiperight, wipeup, wipedown, slideleft, slideright, slideup, slidedown, circlecrop, rectcrop, distance, fadeblack, fadewhite, radial, smoothleft, smoothright, smoothup, smoothdown, circleopen, circleclose, vertopen, vertclose, horzopen, horzclose, dissolve, pixelize, diagtl, diagtr, diagbl, diagbr, hlslice, hrslice, vuslice, vdslice, hblur, fadegrays, wipetl, wipetr, wipebl, wipebr, squeezeh, squeezev, zoomin, fadefast, fadeslow, hlwind, hrwind, vuwind, vdwind, coverleft, coverright, coverup, coverdown, revealleft, revealright, revealup, revealdown. No push: `push_*` maps to `cover*`/`reveal*` pairs or a custom expression (M6).
+- Gemini models visible to the key: **no key set** (`GEMINI_API_KEY` absent from `.env`). `VLM_PROVIDER` defaults to `pegasus`. `google-genai` 3.0.0 is installed and imports.
 
 ---
 
 ## 9. Decisions log
 
 - 2026-11-11: plan written. Same-shot pass scoped to timing integrity only; cut correctness comes from the gold set and the marker pass.
+- 2026-11-11 M0: git repo created. OCR uses the RapidOCR fallback (PaddleOCR fails at inference on Windows). OpenCV is `opencv-contrib-python`, not headless, because mediapipe depends on it; the plan's dependency list is corrected. HyperFrames works with alpha, so M9 order stands. `ff.py` added with `fps()` and `video_stream()` beyond the listed helpers.
 
 ---
 
