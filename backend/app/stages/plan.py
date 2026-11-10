@@ -7,14 +7,25 @@ from ..models import CaptionStyle, Match, PatchOp, Plan, PlanShot, ShotSpec
 CAP_PAD = 0.2
 
 
-def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music_path: str | None, captions: bool) -> Plan:
+def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music_path: str | None, captions: bool,
+          template=None) -> Plan:
+    """template (ir.Template): frame-exact timing pinned to the reference; skipped slots' frames go to a neighbour
+    so the total stays n_frames and the reference audio stays in sync."""
     by_shot = {m["shot_id"]: Match(**m) for m in matches}
-    out = []
+    slot_frames = {k + 1: s.end - s.start for k, s in enumerate(template.slots)} if template else {}
+    out, orphan = [], 0
     for raw in shots:
         s = ShotSpec(**raw)
         m = by_shot.get(s.shot_id)
         if s.skipped or not m or not m.asset_id or m.asset_id not in assets:
+            if template:
+                if out:
+                    out[-1].frames += slot_frames[s.shot_id]
+                else:
+                    orphan += slot_frames[s.shot_id]
             continue
+        if template:  # the slot's exact length, plus any leading skipped slots
+            s = s.model_copy(update={"end": s.start + (slot_frames[s.shot_id] + orphan) / 30})
         seg = max(0.1, m.end - m.start)
         if seg >= s.duration:
             src_out, speed = m.start + s.duration, 1.0
@@ -24,6 +35,9 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
                       src_in=m.start, src_out=src_out, speed=speed, caption=s.text, transition=s.transition_out,
                       fit=s.fit, animation=s.animation, caption_animation=s.caption_animation,
                       caption_style=s.caption_style, grade=s.grade)
+        if template:
+            ps.frames, orphan = slot_frames[s.shot_id] + orphan, 0
+            ps.transition = "cut"  # M2: transitions are rebuilt from the template (M6), not from ShotSpec
         if s.layout == "collage":
             tiles = [assets[a]["path"] for a in m.extra_assets if a in assets][: s.collage.tiles - 1]
             if tiles:  # one tile alone is just a single shot
@@ -31,7 +45,11 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
         _fit_caption(ps)
         _custom_caption_timing(ps, s)
         out.append(ps)
-    return Plan(shots=out, music_path=music_path, captions=captions)
+    plan = Plan(shots=out, music_path=music_path, captions=captions)
+    if template and out:
+        plan.n_frames = template.n_frames
+        assert sum(p.frames for p in out) == template.n_frames, "slot frames must add up to the reference length"
+    return plan
 
 
 def _fit_caption(ps: PlanShot) -> None:
@@ -70,6 +88,11 @@ def _apply(plan: Plan, shot: PlanShot, op: PatchOp, resolve_asset) -> None:
     v = op.value
     f = op.field
     if f == "drop":
+        if shot.frames is not None:  # frame-exact plan: a neighbour takes the frames so the audio stays in sync
+            if len(plan.shots) == 1:
+                raise ValueError("cannot drop the only shot")
+            i = plan.shots.index(shot)
+            plan.shots[i - 1 if i else 1].frames += shot.frames
         plan.shots.remove(shot)
     elif f == "in":
         shot.src_in = max(0.0, float(v))

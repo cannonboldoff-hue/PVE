@@ -4,7 +4,7 @@ from app.clients import twelvelabs
 from app.models import Match, ShotSpec
 from app.stages import brief as brief_mod
 from app.stages import plan as plan_mod
-from app.stages import preproduction, reference, styles
+from app.stages import preproduction, styles
 
 
 def test_caption_style_from_analysis_text():
@@ -62,20 +62,6 @@ def test_template_carries_the_new_structure():
     # the LLM fill only rewrites content, so these structural fields survive it
     filled = t[0].model_copy(update={"purpose": "new", "text": "HELLO"})
     assert filled.caption_style.font == "Impact" and filled.grade.preset == "warm"
-
-
-def test_pick_analysis_prefers_the_run_matching_detected_cuts():
-    cuts = [2.0, 4.0, 6.0, 8.0]  # 5 shots expected
-    runs = iter([{"shots": [{"start": 0, "end": 5}, {"start": 5, "end": 10}]},  # 2 shots: off by 3
-                 {"shots": [{"start": i * 2, "end": i * 2 + 2} for i in range(5)]}])  # 5 shots: matches
-    data, passes = reference.pick_analysis(lambda: next(runs), cuts, 10.0)
-    assert len(data["shots"]) == 5 and passes == 2
-
-
-def test_pick_analysis_trusts_the_model_when_cuts_are_soft():
-    calls = []
-    data, passes = reference.pick_analysis(lambda: calls.append(1) or {"shots": [{"start": 0, "end": 5}, {"start": 5, "end": 10}]}, [5.0], 10.0)
-    assert passes == 1 and len(calls) == 1 and len(data["shots"]) == 2  # one detected cut can't judge a model run
 
 
 def test_collage_match_uses_ranked_hits_then_the_rest(monkeypatch):

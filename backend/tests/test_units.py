@@ -26,12 +26,6 @@ def test_url_normaliser(url, key):
     assert reference.cache_key(url) == key
 
 
-def test_snap_to_scene_cuts():
-    shots = [{"start": 0, "end": 2.1}, {"start": 2.1, "end": 5.0}, {"start": 5.0, "end": 8}]
-    out = reference.snap(shots, [2.4, 5.1], 8.0)
-    assert [(s["start"], s["end"]) for s in out] == [(0, 2.4), (2.4, 5.1), (5.1, 8.0)]
-
-
 def test_retime_contiguous():
     shots = [ShotSpec(shot_id=9, start=5, end=7, purpose="", subject="", action=""),
              ShotSpec(shot_id=3, start=0, end=1.5, purpose="", subject="", action="")]

@@ -59,13 +59,52 @@ def score(labels: dict, pred: dict) -> dict[str, dict]:
     return rows
 
 
+def agreement(a: list, b: list) -> dict[str, float]:
+    """Share of slots where two providers' SlotMeanings give the same value, per field."""
+    from app.stages.meaning import VOCAB
+
+    out = {}
+    for f in VOCAB:
+        pairs = [(x.fields.get(f), y.fields.get(f)) for x, y in zip(a, b)]
+        pairs = [(x, y) for x, y in pairs if x and y]
+        out[f] = sum(x.value.lower() == y.value.lower() for x, y in pairs) / len(pairs) if pairs else float("nan")
+    return out
+
+
+def provider_ab(reels: list[Path]) -> None:
+    """The A/B the research asked for: Gemini vs Pegasus on the same measured slots."""
+    from app import evidence
+    from app.stages import analyze, fusion, meaning
+
+    rows: dict[str, list[float]] = {}
+    for d in reels:
+        f = reel_file(d)
+        src = analyze.ingest(f)
+        ev = evidence.run_all(src.key)
+        slots, _ = fusion.slots_from_cuts(src, ev)
+        got = {}
+        for p in ("gemini", "pegasus"):
+            with meaning.Session(src.key, f, p) as s:
+                got[p] = meaning.describe_slots(s, slots, ev)
+        for field, v in agreement(got["gemini"], got["pegasus"]).items():
+            rows.setdefault(field, []).append(v)
+    print(f"{'field':12} {'agreement':>9}  (gemini vs pegasus, mean over {len(reels)} reels)")
+    for field, vs in rows.items():
+        vs = [v for v in vs if v == v]
+        print(f"{field:12} {sum(vs) / len(vs) if vs else float('nan'):9.3f}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-log", action="store_true")
+    ap.add_argument("--providers", action="store_true", help="per-field agreement between Gemini and Pegasus")
     a = ap.parse_args()
     reels = [d for d in sorted(GOLD.iterdir()) if (d / "labels.json").exists()] if GOLD.exists() else []
     if not reels:
         print(f"no gold reels in {GOLD} (each needs <reel>/labels.json and the video file)")
+        return
+    if a.providers:
+        provider_ab(reels)
         return
     run = {"time": time.time(), "reels": {}}
     print(f"{'reel':24} {'track':12} {'P':>6} {'R':>6} {'F1':>6} {'MAE':>6} {'n':>4}")

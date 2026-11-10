@@ -13,7 +13,7 @@ def _template() -> ir.Template:
                    requirement=ir.Requirement(media="video", footage_frames=60), layout_boxes=[k.box])
     return ir.Template(
         v=1, key="abc", n_frames=90, audio="a.wav",
-        slots=[slot, ir.Slot(id="s02", start=45, end=90, media=ir.F[ir.Literal["video", "photo"]](value="photo"))],
+        slots=[slot, ir.Slot(id="s02", start=45, end=90, media=ir.F[ir.Media](value="photo"))],
         transitions=[ir.Transition(after_slot="s01", type=ir.F[ir.TransitionType](value="other", raw="ink bleed"),
                                    start=40, end=50, params={"dir": "left"}, loss="no ink shader")],
         effects=[ir.Effect(id="e1", type=ir.F[ir.EffectType](value="flash"), start=44, end=46)],

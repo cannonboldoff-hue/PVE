@@ -81,7 +81,7 @@ async def run_brief(pid: str, key: str, analysis: dict) -> None:
     """Template is ready (just extracted, or picked from the saved ones): write the brief that will fill it."""
     p = state.get(pid)
     conv = p["conv_id"]
-    brief = await brief_mod.make_brief(analysis, p["goal"])
+    brief = await brief_mod.make_brief(brief_mod.brief_input(key, analysis), p["goal"])
     # the reference's own song is the default soundtrack; "no music" in chat switches it off
     brief.music = "reference" if music.audio_path(key).exists() else ("none" if brief.music == "reference" else brief.music)
     db.update("projects", pid, reference_id=key, error=None, brief=brief.model_dump())
@@ -206,13 +206,15 @@ async def run_production(pid: str, rebuild: bool = True) -> None:
     if rebuild:
         brief = Brief(**p["brief"])
         track, mode = music.music_for(p["brief"], p, assets)
-        plan = plan_mod.build(p["shots"], p["matches"], assets, track, brief.captions)
+        template = brief_mod.load_ir(p["reference_id"])
+        plan = plan_mod.build(p["shots"], p["matches"], assets, track, brief.captions, template)
         if not plan.shots:
             raise RuntimeError("no shots with a clip to render")
         plan.music_mode = mode
         if mode == "replace":
             plan.music_volume = music.REFERENCE_VOLUME
-        await asyncio.to_thread(music.sync_plan, plan, assets)  # land cuts on the song's beats
+            if template:  # timing is pinned to the reference audio: play it unchanged
+                plan.audio_mode, plan.music_volume = "reference", 1.0
         db.update("projects", pid, plan=plan.model_dump())
         if state.get(pid)["state"] != "PRODUCING":  # already PRODUCING when retried after a failure
             state.transition(pid, "PRODUCING")

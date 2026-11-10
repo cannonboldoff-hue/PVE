@@ -13,10 +13,10 @@ _ensure_ffmpeg_on_path()
 AUDIO_RATE = 8000  # audio_lag works on mono 8 kHz: enough for alignment, cheap to correlate
 
 
-def run(args: list[str]) -> None:
-    """ffmpeg with args; raises with the last stderr lines on failure."""
+def run(args: list[str], cwd: str | Path | None = None) -> None:
+    """ffmpeg with args; raises with the last stderr lines on failure. cwd lets filters take bare file names."""
     p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *map(str, args)],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+                       cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode:
         tail = "\n".join(p.stderr.strip().splitlines()[-8:])
         raise RuntimeError(f"ffmpeg failed ({p.returncode}): {tail}")
@@ -44,6 +44,25 @@ def fps(path: str | Path) -> float:
 
 def count_frames(path: str | Path) -> int:
     return int(video_stream(probe(path, count=True))["nb_read_frames"])
+
+
+def audio_duration(path: str | Path) -> float | None:
+    """Decoded length of the first audio stream in seconds, None when there is none."""
+    a = next((s for s in probe(path)["streams"] if s["codec_type"] == "audio"), None)
+    if a is None:
+        return None
+    return len(audio_samples(path)) / AUDIO_RATE
+
+
+def loudness(path: str | Path) -> float:
+    """Integrated loudness in LUFS (EBU R128)."""
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-vn", "-af", "ebur128", "-f", "null", "-"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    tail = p.stderr[p.stderr.rfind("Summary:"):]
+    for line in tail.splitlines():
+        if line.strip().startswith("I:"):
+            return float(line.split()[1])
+    raise RuntimeError(f"no loudness measured for {path}")
 
 
 def ssim(a: str | Path, b: str | Path) -> list[float]:

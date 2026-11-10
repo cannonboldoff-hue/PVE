@@ -32,7 +32,8 @@ def _content(path: Path, reference: dict) -> dict:
 
 
 async def verify(plan: Plan, final: Path, duration: float, brief: dict, reference: dict) -> tuple[JudgeResult, dict, dict | None]:
-    tech = await asyncio.to_thread(video.tech_checks, final, duration)
+    ref_audio = plan.music_path if plan.audio_mode == "reference" else None
+    tech = await asyncio.to_thread(video.tech_checks, final, duration, ref_audio)
     long = [s.shot_id for s in plan.shots if len(s.caption) > MAX_CAPTION_CHARS]
     tech["caption_length"] = {"ok": not long, "detail": f"too long in shots {long}" if long else "ok"}
     tech_ok = all(c["ok"] for c in tech.values())

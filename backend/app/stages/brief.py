@@ -10,10 +10,22 @@ from . import memory, styles
 SYS = "You are a short-form video producer. Reply with JSON only."
 
 
+def brief_input(key: str, analysis: dict) -> dict:
+    """What the brief prompt sees: a compact template summary for IR templates, the analysis for legacy ones."""
+    from .. import ir
+    from . import extract
+
+    row = db.one("SELECT template, shots FROM templates WHERE key=?", (key,))
+    if row and row.get("template"):
+        t = ir.Template.model_validate(row["template"])
+        return {"pacing": analysis.get("pacing", ""), **extract.summary(t, [ShotSpec.model_validate(s) for s in row["shots"]])}
+    return analysis
+
+
 async def make_brief(analysis: dict, goal: str) -> Brief:
     prefs = memory.prefs()
     msg = (
-        f"Reference Reel analysis:\n{json.dumps(analysis)[:12000]}\n\nUser goal: {goal or '(not stated)'}\n"
+        f"Reference Reel analysis:\n{json.dumps(analysis)}\n\nUser goal: {goal or '(not stated)'}\n"
         f"Known user preferences (use as defaults unless the goal says otherwise): {json.dumps(prefs)}\n\n"
         "Write the creative brief for a new 9:16 Reel in the same style: what to keep from the reference "
         "(pacing, style, structure, transitions), what to change (subject, text, product), target length in "
@@ -31,34 +43,58 @@ _TRANSITIONS = set(get_args(ShotSpec.model_fields["transition_out"].annotation))
 _CAP_ANIM = {"fade", "pop", "slide_up"}
 
 
+def shotspec(i: int, s: dict) -> ShotSpec:
+    """One analysed shot (legacy SHOT schema fields) -> ShotSpec: camera, transition, fit, animation, caption style
+    and timing, colour grade, collage layout."""
+    s = {**s, **{k: s.get(k) or "" for k in ("description", "subject", "action")}}
+    bg = (s.get("background") or "").lower()
+    motion = (s.get("frame_motion") or "").lower()
+    cap = (s.get("caption_animation") or "").lower().replace(" ", "_")
+    tr = (s.get("transition_out") or "").lower().replace(" ", "")
+    cs, ce = styles.caption_timing(s)
+    lay, collage = styles.layout(s)
+    return ShotSpec(
+        shot_id=i, start=s["start"], end=s["end"], purpose=s["description"], subject=s["subject"], action=s["action"],
+        caption_style=styles.caption_style(s), caption_start=cs, caption_end=ce, grade=styles.grade(s),
+        layout=lay, collage=collage, asset_type="photo" if lay == "collage" else "video",
+        camera=s.get("camera") or "", camera_motion=s.get("camera_motion") or "", text=s.get("on_screen_text") or "",
+        transition_out=tr if tr in _TRANSITIONS else "cut", background=s.get("background") or "",
+        fit="blur_fit" if any(w in bg for w in ("blur", "inset", "collage")) else "cover",
+        animation="zoom_in" if "zoom in" in motion else "zoom_out" if "zoom out" in motion else "none",
+        caption_animation=cap if cap in _CAP_ANIM else "none", overlay=s.get("overlays") or "")
+
+
 def extract_template(analysis: dict) -> list[ShotSpec]:
-    """Deterministic, brief-independent structure of the reference: timing, camera, transition, fit, animation,
-    caption style and timing, colour grade, collage layout."""
-    out = []
-    for i, s in enumerate(analysis["shots"], 1):
-        bg = s.get("background", "").lower()
-        motion = s.get("frame_motion", "").lower()
-        cap = s.get("caption_animation", "").lower().replace(" ", "_")
-        tr = s.get("transition_out", "").lower().replace(" ", "")
-        cs, ce = styles.caption_timing(s)
-        lay, collage = styles.layout(s)
-        out.append(ShotSpec(
-            shot_id=i, start=s["start"], end=s["end"], purpose=s["description"], subject=s["subject"], action=s["action"],
-            caption_style=styles.caption_style(s), caption_start=cs, caption_end=ce, grade=styles.grade(s),
-            layout=lay, collage=collage, asset_type="photo" if lay == "collage" else "video",
-            camera=s.get("camera", ""), camera_motion=s.get("camera_motion", ""), text=s.get("on_screen_text", ""),
-            transition_out=tr if tr in _TRANSITIONS else "cut", background=s.get("background", ""),
-            fit="blur_fit" if any(w in bg for w in ("blur", "inset", "collage")) else "cover",
-            animation="zoom_in" if "zoom in" in motion else "zoom_out" if "zoom out" in motion else "none",
-            caption_animation=cap if cap in _CAP_ANIM else "none", overlay=s.get("overlays", "")))
-    return retime(out)
+    """Legacy analyses only: deterministic, brief-independent structure from the whole-video analysis."""
+    return retime([shotspec(i, s) for i, s in enumerate(analysis["shots"], 1)])
 
 
 def save_template(key: str, analysis: dict) -> None:
-    """Upsert the template for a reference; structure only changes when the analysis changes."""
+    """Upsert the template for a reference; structure only changes when the analysis changes.
+    IR analyses (ref_key set) store the Template as source of truth and the ShotSpecs derived from it."""
+    from .. import ir
+    from . import extract
+
+    title = (analysis.get("overall_style") or key)[:60]
+    if analysis.get("ref_key") and (t := ir.load(analysis["ref_key"], "template", ir.Template)):
+        shots = [s.model_dump() for s in extract.to_shotspecs(t, analysis["shots"])]
+        delta = ir.load(analysis["ref_key"], "delta", ir.Delta)
+        db.run("INSERT OR REPLACE INTO templates(key,title,shots,analysis_version,template,delta,ir_version,created) "
+               "VALUES(?,?,?,?,?,?,?,?)",
+               (key, title, json.dumps(shots), analysis.get("v"), t.model_dump_json(),
+                delta.model_dump_json() if delta else None, t.v, db.now()))
+        return
     shots = [s.model_dump() for s in extract_template(analysis)]
     db.run("INSERT OR REPLACE INTO templates(key,title,shots,analysis_version,created) VALUES(?,?,?,?,?)",
-           (key, (analysis.get("overall_style") or key)[:60], json.dumps(shots), analysis.get("v"), db.now()))
+           (key, title, json.dumps(shots), analysis.get("v"), db.now()))
+
+
+def load_ir(key: str | None):
+    """The project's IR Template, or None for legacy templates."""
+    from .. import ir
+
+    row = db.one("SELECT template FROM templates WHERE key=?", (key,)) if key else None
+    return ir.Template.model_validate(row["template"]) if row and row.get("template") else None
 
 
 def get_template(key: str, analysis: dict) -> list[ShotSpec]:

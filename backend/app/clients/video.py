@@ -35,13 +35,12 @@ def info(path: str | Path) -> dict:
     return {"duration": float(i.duration), "width": w, "height": h, "fps": i.fps, "has_audio": bool(i.audio_codec)}
 
 
-def scene_cuts(path: str | Path, threshold: float = 0.3) -> list[float]:
-    d = client().detect_scenes(str(path), threshold=threshold, min_scene_duration=0.3)
-    return [float(s["start"]) for s in d.scenes[1:]]
+LOUDNESS_TOL_LU = 1.0  # reference-audio renders: integrated loudness must stay this close to the reference
 
 
-def tech_checks(path: str | Path, expect_duration: float) -> dict:
-    """Layer-1 verifier checks. Each value is {ok, detail}."""
+def tech_checks(path: str | Path, expect_duration: float, reference_audio: str | None = None) -> dict:
+    """Layer-1 verifier checks. Each value is {ok, detail}. With reference_audio (plan.audio_mode == "reference")
+    the true-peak rule is replaced: the reference's own mastering is not ours to judge, only that it is unchanged."""
     i = info(path)
     q = client().quality_check(str(path))
     q = q if isinstance(q, dict) else q.model_dump()
@@ -62,6 +61,15 @@ def tech_checks(path: str | Path, expect_duration: float) -> dict:
     peak = (by.get("audio_levels") or {}).get("details", {}).get("true_peak")
     if not i["has_audio"]:
         out["audio"] = {"ok": False, "detail": "no audio track"}
+    elif reference_audio:
+        from . import ff
+
+        v_len = ff.count_frames(path) / 30
+        a_len = ff.audio_duration(path) or 0.0
+        lu, ref_lu = ff.loudness(path), ff.loudness(reference_audio)
+        ok = abs(a_len - v_len) <= 1 / 30 and abs(lu - ref_lu) <= LOUDNESS_TOL_LU
+        out["audio"] = {"ok": ok, "detail": f"audio {a_len:.3f}s vs video {v_len:.3f}s; {lu:.1f} LUFS vs reference "
+                                            f"{ref_lu:.1f} LUFS"}
     else:
         out["audio"] = {"ok": peak is None or peak < -0.1, "detail": f"true peak {peak} dBTP" if peak is not None else "ok"}
     return out

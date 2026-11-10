@@ -5,8 +5,9 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .. import db
+from .. import config, db
 from ..models import Plan
+from ..render import assemble, shot
 from . import editor
 from .graph import Node, compile_plan, order
 
@@ -43,10 +44,12 @@ def run(pid: str, plan: Plan, workdir: Path, on_progress: Callable[[], None]) ->
             on_progress()
             for attempt in (0, 1):  # retry a failing node once
                 try:
+                    exact = plan.n_frames is not None
                     if n.kind == "prep":
-                        editor.prep_clip(n.params, out)
+                        (shot.prep if n.params.get("frames") is not None else editor.prep_clip)(n.params, out)
                     else:
-                        durations["total"] = editor.assemble(plan, [outputs[d] for d in n.deps], workdir, out)
+                        join = assemble.assemble if exact else editor.assemble
+                        durations["total"] = join(plan, [outputs[d] for d in n.deps], workdir, out)
                     break
                 except Exception as e:
                     out.unlink(missing_ok=True)
@@ -68,5 +71,5 @@ def run(pid: str, plan: Plan, workdir: Path, on_progress: Callable[[], None]) ->
     if "total" not in durations:  # assemble was a cache hit
         from ..clients import video
 
-        durations["total"] = video.info(final)["duration"]
+        durations["total"] = plan.n_frames / config.FPS if plan.n_frames else video.info(final)["duration"]
     return final, durations["total"], hits

@@ -33,6 +33,10 @@ def compile_plan(plan: Plan) -> list[Node]:
         p = {"src": _file_id(s.path), "in": s.src_in, "out": s.src_out, "speed": s.speed, "fit": s.fit, "animation": s.animation,
              "grade": s.grade.model_dump(), "collage": s.collage.model_dump() if s.collage else None,
              "tiles": [_file_id(t) for t in s.tiles]}
+        if s.frames is not None:  # frame-exact renderer (render/shot.py); legacy plans keep their old hashes
+            p |= {"frames": s.frames, "lead": s.lead, "tail": s.tail, "speed_curve": s.speed_curve,
+                  "reverse": s.reverse, "freeze": s.freeze, "camera_path": s.camera_path,
+                  "layout_boxes": s.layout_boxes, "colour": s.colour}
         n = Node(f"prep_clip[{s.shot_id}]", "prep", {**p, "path": s.path, "tile_paths": s.tiles})
         n.hash = _h(p)
         nodes.append(n)
@@ -43,6 +47,9 @@ def compile_plan(plan: Plan) -> list[Node]:
         "captions": [[s.caption, s.cap_start, s.cap_end, s.caption_animation, s.caption_style.model_dump()] for s in plan.shots] if plan.captions else [],
         "music": [_file_id(plan.music_path), plan.music_volume, plan.music_mode],
     }
+    if plan.n_frames is not None:
+        ap |= {"n_frames": plan.n_frames, "frames": [s.frames for s in plan.shots], "audio_mode": plan.audio_mode,
+               "transitions_ir": plan.transitions, "effects": plan.effects, "texts": plan.texts, "overlays": plan.overlays}
     a = Node("assemble", "assemble", {**ap, "music_path": plan.music_path}, [n.id for n in preps])
     a.hash = _h(ap)
     nodes.append(a)

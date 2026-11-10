@@ -1,55 +1,15 @@
-"""Reference Analyzer: URL -> cached blueprint. The reference video is deleted after analysis."""
+"""Reference Analyzer: URL -> cached blueprint. The uploaded/downloaded original is deleted after analysis; the
+30 fps proxy stays under data/refs/<key>/ until template validation decides (M11)."""
 import hashlib
 import json
 import re
 import shutil
 from pathlib import Path
 
-from .. import config, db
-from ..clients import twelvelabs, video
+from .. import config, db, ir
 from . import music
 
-SHOT = {
-    "type": "object",
-    "properties": {
-        "start": {"type": "number"}, "end": {"type": "number"},
-        "description": {"type": "string"}, "subject": {"type": "string"}, "action": {"type": "string"},
-        "camera": {"type": "string"}, "camera_motion": {"type": "string"},
-        "on_screen_text": {"type": "string"}, "transition_out": {"type": "string"},
-        "background": {"type": "string"}, "frame_motion": {"type": "string"},
-        "overlays": {"type": "string"}, "caption_animation": {"type": "string"},
-        "caption_font": {"type": "string"}, "caption_color": {"type": "string"}, "caption_position": {"type": "string"},
-        "caption_size": {"type": "string"}, "caption_emphasis": {"type": "string"},
-        "caption_start": {"type": "number"}, "caption_end": {"type": "number"},
-        "color_look": {"type": "string"}, "layout": {"type": "string"}, "collage_tiles": {"type": "integer"},
-        "collage_background": {"type": "string"}, "collage_style": {"type": "string"},
-    },
-    "required": ["start", "end", "description", "subject", "action"],
-}
-ANALYSIS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "overall_style": {"type": "string"}, "pacing": {"type": "string"},
-        "music_mood": {"type": "string"}, "caption_style": {"type": "string"},
-        "shots": {"type": "array", "items": SHOT},
-    },
-    "required": ["overall_style", "pacing", "shots"],
-}
-PROMPT = ("Break this short-form video into its shots. For each shot give start and end seconds, what is shown, "
-          "the subject, the action, camera framing, camera motion, any on-screen text and the transition into the "
-          "next shot (cut, fade, wipe, slide, zoom). Also give, per shot: the background (what is behind or around "
-          "the subject, whether the picture is shown full-frame or inset over a blurred or coloured backdrop or in a "
-          "collage), frame_motion (zoom in/out, pan, scrolling, shake, none), overlays (stickers, emoji, frames, "
-          "graphics) and how the on-screen text animates in (fade, pop, slide, typewriter, none). For on-screen text also give "
-          "caption_font (look: bold sans, script, serif, impact, playful...), caption_color, caption_position (top, middle, "
-          "bottom), caption_size (small, medium, large), caption_emphasis (words shown in a different colour), and "
-          "caption_start and caption_end in seconds of the video. Per shot also give color_look (warm, cool, vintage, "
-          "cinematic, black and white, bright, dark, high contrast, muted, saturated...), layout ('single' or "
-          "'collage'), and for a collage: collage_tiles (number of pictures), collage_background (colour) and "
-          "collage_style (tilted, framed, straight). Also describe overall style, pacing, music mood and caption style.")
-
-
-ANALYSIS_VERSION = 3  # 3: caption style and timing, colour look, collage layout; 2: background, motion, overlays
+ANALYSIS_VERSION = 4  # 4: measured cut list + typed per-slot meaning (IR template); 3: whole-video analysis
 
 
 class DownloadFailed(Exception):
@@ -83,22 +43,6 @@ def fingerprint(path: Path) -> str:
     return h.hexdigest()
 
 
-def snap(shots: list[dict], cuts: list[float], duration: float, tol: float = 0.6) -> list[dict]:
-    """Model timestamps drift; snap each internal boundary to the nearest detected scene cut."""
-    shots = sorted(shots, key=lambda s: s["start"])
-    bounds = [0.0]
-    for s in shots[1:]:
-        near = min(cuts, key=lambda c: abs(c - s["start"]), default=None)
-        bounds.append(near if near is not None and abs(near - s["start"]) <= tol else s["start"])
-    bounds.append(duration)
-    out = []
-    for i, s in enumerate(shots):
-        lo, hi = bounds[i], bounds[i + 1]
-        if hi - lo >= 0.3:
-            out.append({**s, "start": round(lo, 2), "end": round(hi, 2)})
-    return out
-
-
 def download(url: str, dest: Path) -> Path:
     import yt_dlp
 
@@ -128,35 +72,26 @@ def lookup_fp(fp: str) -> tuple[str, dict] | None:
     return (r["key"], r["analysis"]) if r else None
 
 
-def _analyze_file(path: Path) -> dict:
-    info = video.info(path)
-    cuts = video.scene_cuts(path)
-    aid = twelvelabs.upload_asset(str(path))
-    try:
-        data, passes = pick_analysis(lambda: twelvelabs.analyze(aid, PROMPT, ANALYSIS_SCHEMA), cuts, info["duration"])
-    finally:
-        twelvelabs.delete_asset(aid)  # reference leaves TwelveLabs as well as local disk
-    data["duration"] = info["duration"]
-    data["v"] = ANALYSIS_VERSION
-    data["cut_check"] = {"detected_cuts": len(cuts), "shots": len(data["shots"]), "passes": passes}
-    return data
+def _pacing(t: ir.Template) -> str:
+    lens = [ir.f2s(s.frames) for s in t.slots]
+    return f"{len(lens)} shots, average {sum(lens) / len(lens):.1f} s (shortest {min(lens):.1f} s, longest {max(lens):.1f} s)"
 
 
-def pick_analysis(run, cuts: list[float], duration: float, max_passes: int = 3) -> tuple[dict, int]:
-    """Pegasus' shot count varies between runs. Where the frames show clear cuts (2+), re-run up to max_passes
-    times and keep the analysis whose shot count is closest to the detected cuts + 1."""
-    best, best_gap, passes = None, 10**9, 0
-    for passes in range(1, max_passes + 1):
-        data = run()
-        data["shots"] = snap(data["shots"], cuts, duration)
-        if len(cuts) < 2:  # soft transitions (scrolls, fades): the frame check can't judge, trust the model
-            return data, passes
-        gap = abs(len(data["shots"]) - (len(cuts) + 1))
-        if gap < best_gap:
-            best, best_gap = data, gap
-        if best_gap <= max(1, round(0.25 * (len(cuts) + 1))):
-            break
-    return best, passes
+def _analyze_file(path: Path, audio_key: str) -> dict:
+    from . import analyze as pipeline
+    from .fusion import Observed
+
+    ref_key, t, delta = pipeline.run(path, audio_key)
+    obs = ir.load(ref_key, "observed", Observed)
+    # legacy per-shot fields for the ShotSpec adapter: the typed meaning plus the style notes styles.py parses
+    shots = [{**style, "description": s.function.value, "subject": s.subject.value, "action": s.action.value,
+              "camera": s.angle.value, "start": ir.f2s(s.start), "end": ir.f2s(s.end)}
+             for s, style in zip(t.slots, obs.style)]
+    return {"v": ANALYSIS_VERSION, "ref_key": ref_key, "duration": ir.f2s(t.n_frames), "n_frames": t.n_frames,
+            "overall_style": t.narrative.get("overall_style", ""), "pacing": _pacing(t),
+            "shots": shots,
+            "cut_check": {"detected_cuts": len(t.cuts()), "shots": len(t.slots)},
+            "validation": {"passed": delta.passed, "rows": [r.model_dump(mode="json") for r in delta.rows]}}
 
 
 def analyze(url: str | None, workdir: Path, file: Path | None = None) -> tuple[str, dict]:
@@ -170,16 +105,15 @@ def analyze(url: str | None, workdir: Path, file: Path | None = None) -> tuple[s
     try:
         path = file or download(url, workdir)
         fp = fingerprint(path)
-        if (hit := lookup_fp(fp)) and not key:
+        if (hit := lookup_fp(fp)) and not key and hit[1].get("v") == ANALYSIS_VERSION:
             return hit
-        analysis = _analyze_file(path)
         key = key or f"file:{fp[:16]}"
-        music.extract(path, key)
+        analysis = _analyze_file(path, key)
         db.run("INSERT OR REPLACE INTO reference_cache(key,platform,fingerprint,analysis,created) VALUES(?,?,?,?,?)",
                (key, key.split(":")[0], fp, json.dumps(analysis), db.now()))
         return key, analysis
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)  # no reference video stays on disk
+        shutil.rmtree(workdir, ignore_errors=True)  # the original goes; only the proxy stays, until validation (M11)
 
 
 def _keep_audio_only(key: str, url: str | None, workdir: Path, file: Path | None) -> None:

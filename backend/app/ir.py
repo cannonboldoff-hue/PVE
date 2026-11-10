@@ -42,6 +42,7 @@ Role = Literal["hook", "establish", "detail", "action", "reveal", "reaction", "p
 TextRole = Literal["hook_line", "title", "list_item", "label", "punchline", "cta", "caption", "other"]
 ShotSize = Literal["extreme_close", "close", "medium", "wide", "extreme_wide", "none"]
 Binding = Literal["keep", "swap", "drop"]
+Media = Literal["video", "photo", "other"]
 
 
 class F(BaseModel, Generic[T]):
@@ -124,7 +125,7 @@ class Slot(BaseModel):
     id: str  # "s01"
     start: int  # nominal frames; boundaries between slots are the cut frames
     end: int
-    media: F[Literal["video", "photo"]] = Field(default_factory=lambda: F[Literal["video", "photo"]](value="video"))
+    media: F[Media] = Field(default_factory=lambda: F[Media](value="video"))
     role: F[Role] = Field(default_factory=lambda: F[Role](value="other"))
     function: F[str] = Field(default_factory=lambda: F[str](value=""))  # why this shot exists in the story
     subject: F[str] = Field(default_factory=lambda: F[str](value="", binding="swap"))

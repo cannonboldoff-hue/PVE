@@ -139,9 +139,21 @@ class PlanShot(BaseModel):
     grade: Grade = Field(default_factory=Grade)
     collage: Collage | None = None  # set when this shot is a collage
     tiles: list[str] = Field(default_factory=list)  # extra tile files for the collage (the main clip is tile 1)
+    # frame-exact path (docs/mvp-plan.md 4); all optional so legacy plans are unaffected
+    frames: int | None = None  # exact output length incl. transition overlaps
+    lead: int = 0  # overlap frames shared with the previous transition
+    tail: int = 0  # overlap frames shared with the next transition
+    speed_curve: list[tuple[float, float]] | None = None
+    reverse: bool = False
+    freeze: list[tuple[int, int]] = Field(default_factory=list)
+    camera_path: list[dict] = Field(default_factory=list)  # ir.Key dicts
+    layout_boxes: list[dict] = Field(default_factory=list)
+    colour: dict | None = None
 
     @property
     def duration(self) -> float:
+        if self.frames is not None:
+            return self.frames / 30  # config.FPS; models stay free of app imports
         return (self.src_out - self.src_in) / self.speed
 
 
@@ -151,6 +163,12 @@ class Plan(BaseModel):
     music_volume: float = 0.35
     music_mode: Literal["duck", "replace"] = "duck"  # replace: the song is the whole soundtrack
     captions: bool = True
+    n_frames: int | None = None
+    transitions: list[dict] = Field(default_factory=list)  # ir.Transition dicts
+    effects: list[dict] = Field(default_factory=list)
+    texts: list[dict] = Field(default_factory=list)
+    overlays: list[dict] = Field(default_factory=list)
+    audio_mode: Literal["legacy", "reference"] = "legacy"
 
 
 PatchField = Literal["in", "out", "speed", "caption", "cap_start", "cap_end", "transition", "fit", "animation",

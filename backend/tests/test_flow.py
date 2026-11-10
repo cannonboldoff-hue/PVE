@@ -1,19 +1,22 @@
-"""End-to-end through HTTP with OpenRouter / TwelveLabs / yt-dlp stubbed. Real ffmpeg renders."""
+"""End-to-end through HTTP with OpenRouter / TwelveLabs / yt-dlp stubbed. Real ffmpeg renders, real cut detection
+on a synthetic reference reel, frame-exact rendering pinned to the reference audio."""
 import json
+import shutil
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app import db
+from app import db, ir
+from app.clients import ff as ffc
 from app.clients import openrouter, twelvelabs
-from helpers import ff
 from app.models import Brief, JudgeResult, Issue, MissingInstruction, MissingList, PatchList, PatchOp, ShotContent, ShotContentList
-from app.stages import reference
+from app.stages import brief as brief_mod
+from app.stages import music, reference
+from helpers import ff
+from synth import SynthSpec, make_reel
 
-ANALYSIS = {"overall_style": "fast", "pacing": "quick cuts", "duration": 6,
-            "shots": [{"start": (i - 1) * 2, "end": i * 2, "description": "d", "subject": "s", "action": "a",
-                       "transition_out": "fade" if i == 1 else "cut"} for i in (1, 2, 3)]}
+REEL_CUTS = [60, 120]  # 3 shots of 2 s at 30 fps
 
 
 def shot(i, subject):
@@ -55,12 +58,14 @@ def client(tmp_path_factory):
     mp.setattr(openrouter, "chat_json", s.chat_json)
     mp.setattr(openrouter, "chat_stream", s.chat_stream)
 
-    def fake_analyze(url, workdir, file=None):
-        db.run("INSERT OR REPLACE INTO reference_cache(key,platform,fingerprint,analysis,created) VALUES(?,?,?,?,?)",
-               ("youtube:abcdefghijk", "youtube", "fp", json.dumps(ANALYSIS), 0))
-        return "youtube:abcdefghijk", ANALYSIS
+    reel = tmp_path_factory.mktemp("ref") / "reel.mp4"
+    make_reel(SynthSpec(n_frames=180, cuts=REEL_CUTS, textured=True), reel)
 
-    mp.setattr(reference, "analyze", fake_analyze)
+    def fake_download(url, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        return shutil.copy(reel, dest / "ref.mp4")
+
+    mp.setattr(reference, "download", fake_download)
     mp.setattr(twelvelabs, "index_clip", lambda path: (f"ta-{path[-12:]}", f"ti-{path[-12:]}"))
     mp.setattr(twelvelabs, "search", lambda q, limit=10: [
         {"indexed_id": a["tl_indexed_id"], "start": 0.0, "end": 5.0, "rank": i}
@@ -69,6 +74,15 @@ def client(tmp_path_factory):
     mp.setattr(twelvelabs, "delete_asset", lambda a: None)
 
     def fake_tl_analyze(asset_id, prompt, schema, start=None, end=None):
+        if "role" in schema["properties"]:  # typed per-slot meaning, one call per measured slot window
+            assert start is not None and end is not None
+            ans = lambda v: {"value": v, "note": f"note {v}", "confidence": 0.9}  # noqa: E731
+            return {"media": ans("video"), "role": ans("hook" if start == 0 else "detail"),
+                    "function": ans(f"shot at {start:.1f}"), "subject": ans("s"), "action": ans("a"),
+                    "shot_size": ans("close"), "angle": ans("eye level"), "layout": ans("single"),
+                    "camera": ans("static"), "style": {"color_look": "warm"}}
+        if "hook" in schema["properties"]:
+            return {"hook": "h", "arc": "a", "payoff": "p", "cta": "c", "overall_style": "fast cuts"}
         if "match" in schema["properties"]:
             return {"match": "none" if "unicorn" in prompt else "exact", "reason": "stub"}
         return {"subject_in_frame": True, "captions_readable": True, "pacing_close_to_reference": True, "notes": ""}
@@ -118,6 +132,10 @@ def test_full_flow(client, tmp_path):
     # chat -> agent tool call -> reference analysis -> brief
     assert c.post(f"/api/conversations/{cid}/messages", json={"text": "https://youtube.com/shorts/abcdefghijk make it about my bakery"}).status_code == 202
     wait(c, pid, {"BRIEF"})
+    t = brief_mod.load_ir("youtube:abcdefghijk")
+    assert t.cuts() == REEL_CUTS and t.n_frames == 180  # measured, not from the model
+    delta = ir.Delta.model_validate(db.one("SELECT delta FROM templates WHERE key=?", ("youtube:abcdefghijk",))["delta"])
+    assert delta.passed
 
     # clips first, then confirm brief -> shot list
     upload(c, pid, tmp_path, "a.mp4")
@@ -153,6 +171,10 @@ def test_full_flow(client, tmp_path):
     assert p["approved"] == 1 and p["draft_n"] == 2  # draft 1 flagged REPAIR, repaired, draft 2 PASS
     assert p["verifier"]["verdict"] == "PASS"
     assert c.get(f"/api/projects/{pid}/video").status_code == 200
+    # the render has the reference's length and the reference audio, sample-aligned
+    assert ffc.count_frames(p["final_path"]) == 180
+    assert ffc.audio_lag(p["final_path"], music.audio_path("youtube:abcdefghijk")) == 0
+    assert p["plan"]["audio_mode"] == "reference" and [s["frames"] for s in p["plan"]["shots"]] == [60, 60, 60]
     assert len(db.q("SELECT * FROM drafts WHERE project_id=?", (pid,))) == 2
 
     # revision re-runs only changed nodes
