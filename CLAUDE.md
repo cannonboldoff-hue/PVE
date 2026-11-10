@@ -1,0 +1,1 @@
+5. **Subagent model is one tier below the main agent.** When spawning any subagent (Agent tool), always pass `model` explicitly: main agent on Opus → `model: "sonnet"`; main agent on Sonnet → `model: "haiku"`. Never let a subagent inherit the main agent's model.
