@@ -220,9 +220,56 @@ function VerifierCard({ p }: CardProps) {
   );
 }
 
+function TemplateCard({ p, act }: CardProps) {
+  const r = p.template_report;
+  if (!r) return null;
+  const rows: Project[] = r.delta?.rows ?? [];
+  const bad = rows.filter((x) => !x.ok);
+  return (
+    <details className="card" open={bad.length > 0 || r.confirm.length > 0}>
+      <summary>
+        Template check: <Chip label={r.delta?.passed ? "done" : "failed"} /> {rows.length - bad.length} of {rows.length} checks
+        agree, coverage {Math.round((r.delta?.coverage ?? 0) * 100)}%
+      </summary>
+      <small>The template was rendered back with plain test footage and measured again with the same tools.</small>
+      <table className="delta">
+        <thead><tr><th>Track</th><th>Compared</th><th>Reference</th><th>Render</th><th></th></tr></thead>
+        <tbody>
+          {rows.map((x, n) => (
+            <tr key={n} className={x.ok ? "" : "bad"}>
+              <td>{x.track}</td><td>{x.metric}</td><td>{String(x.ref)}</td><td>{String(x.render)}</td>
+              <td><Chip label={x.ok ? "done" : "failed"} /></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {r.losses.length > 0 && (<><h5>Shown differently</h5><ul>{r.losses.map((l: string) => <li key={l}>{l}</li>)}</ul></>)}
+      {r.omissions.length > 0 && (<><h5>Possibly missing</h5><ul>{r.omissions.map((l: string) => <li key={l}>{l}</li>)}</ul></>)}
+      {r.confirm.length > 0 && (
+        <>
+          <h5>Please confirm</h5>
+          <ul>
+            {r.confirm.map((c: Project) => (
+              <li key={c.path}>
+                <code>{c.path}</code> = <b>{String(c.value)}</b> {c.note && <small>({String(c.note)})</small>}{" "}
+                <button onClick={() => act("confirm-template-field", { path: c.path })}>Accept</button>{" "}
+                <button onClick={() => {
+                  const v = window.prompt(`New value for ${c.path}`, String(c.value));
+                  if (v !== null) act("confirm-template-field", { path: c.path, value: v });
+                }}>Edit</button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </details>
+  );
+}
+
 const CARDS: Record<string, (p: CardProps) => ReactNode> = {
   reference_upload: ReferenceUpload, brief: BriefCard, shots: ShotsCard, matches: MatchesCard, film: FilmCard,
   approval: ApprovalCard, progress: ProgressCard, video: VideoCard, final: FinalCard, verifier: VerifierCard,
+  template: TemplateCard,
 };
 
 export default function Card({ type, p, latest, act, guard }: { type: string; p: Project; latest: boolean; act: Act; guard: Guard }) {

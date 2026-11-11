@@ -1,4 +1,8 @@
 """Observed reel -> Template, and the adapter from Template to the ShotSpec list the brief/fill/match steps use."""
+from typing import Literal, get_args
+
+from pydantic import BaseModel, Field
+
 from .. import ir
 from ..ir import Template
 from ..models import ShotSpec
@@ -85,3 +89,104 @@ def summary(t: Template, shots: list[ShotSpec]) -> dict:
                   for k, (s, sp) in enumerate(zip(t.slots, shots))],
         "narrative": t.narrative,
     }
+
+
+# ---- M10: decisions by an LLM, applied by code ----
+
+class FieldDecision(BaseModel):
+    path: str = Field(description="e.g. slots.0.subject, texts.2, effects.1, overlays.0")
+    binding: Literal["keep", "swap", "drop"]
+    reason: str
+
+
+class SlotIntent(BaseModel):
+    slot: str
+    role: str
+    function: str = Field(description="one line: what this shot does for the viewer")
+
+
+class Decisions(BaseModel):
+    fields: list[FieldDecision] = Field(default_factory=list)
+    slots: list[SlotIntent] = Field(default_factory=list)
+
+
+DECIDE_PROMPT = (
+    "This is a measured short-form reel, as JSON. Decide what a reusable template keeps from it. For each field path "
+    "that is content (who or what is shown, on-screen words, stickers) answer swap; for structure and style (timing, "
+    "transitions, camera, layout, look, effects) answer keep; answer drop for things that only make sense for this one "
+    "video (a watermark, a username, a one-off joke) and say why. Give each slot a role (hook, establish, detail, "
+    "action, reveal, reaction, payoff, cta, other) and a one-line function. You cannot change timing or measurements.")
+
+
+def compact(obs: Observed) -> dict:
+    return {
+        "slots": [{"id": s.id, "frames": s.frames, "role": s.role.value, "function": s.function.value,
+                   "subject": s.subject.value, "action": s.action.value, "camera": s.camera.value,
+                   "layout": s.layout.value} for s in obs.slots],
+        "texts": [{"path": f"texts.{k}", "text": e.text.value, "role": e.role.value} for k, e in enumerate(obs.texts)],
+        "effects": [{"path": f"effects.{k}", "type": e.type.value} for k, e in enumerate(obs.effects)],
+        "overlays": [{"path": f"overlays.{k}", "kind": o.kind.value} for k, o in enumerate(obs.overlays)],
+        "transitions": [x.type.value for x in obs.transitions], "narrative": obs.narrative,
+    }
+
+
+def apply_decisions(t: Template, d: Decisions) -> Template:
+    """Bindings, roles and functions only; timing, frames and measured values cannot change. Drops are listed."""
+    before = [(s.start, s.end) for s in t.slots], t.n_frames
+    roles = set(get_args(ir.Role))
+    for intent in d.slots:
+        s = next((x for x in t.slots if x.id == intent.slot), None)
+        if s is None:
+            continue
+        s.role = s.role.__class__(value=intent.role if intent.role in roles else "other", raw=intent.role,
+                                  conf=0.7, source="llm", evidence=s.role.evidence, binding="keep")
+        s.function = s.function.__class__(value=intent.function, raw=intent.function, conf=0.7, source="llm",
+                                          evidence=s.function.evidence, binding="keep")
+    drop_texts, drop_effects, drop_overlays = set(), set(), set()
+    for f in d.fields:
+        parts = f.path.split(".")
+        try:
+            k = int(parts[1])
+        except (IndexError, ValueError):
+            continue
+        if parts[0] == "slots" and len(parts) == 3 and k < len(t.slots) and parts[2] in SEMANTIC:
+            getattr(t.slots[k], parts[2]).binding = f.binding if f.binding != "drop" else "keep"
+        elif parts[0] == "texts" and k < len(t.texts):
+            if f.binding == "drop":
+                drop_texts.add(k)
+                t.dropped |= {i: f.reason for i in t.texts[k].text.evidence}
+            else:
+                t.texts[k].text.binding = f.binding
+        elif parts[0] == "effects" and k < len(t.effects) and f.binding == "drop":
+            drop_effects.add(k)
+            t.dropped |= {i: f.reason for i in t.effects[k].type.evidence}
+        elif parts[0] == "overlays" and k < len(t.overlays):
+            if f.binding == "drop":
+                drop_overlays.add(k)
+                t.dropped |= {i: f.reason for i in t.overlays[k].kind.evidence}
+            else:
+                t.overlays[k].binding = f.binding
+    t.texts = [e for k, e in enumerate(t.texts) if k not in drop_texts]
+    t.effects = [e for k, e in enumerate(t.effects) if k not in drop_effects]
+    t.overlays = [o for k, o in enumerate(t.overlays) if k not in drop_overlays]
+    assert ([(s.start, s.end) for s in t.slots], t.n_frames) == before, "decisions must not change timing"
+    return t
+
+
+SEMANTIC = ("media", "role", "function", "subject", "action", "shot_size", "angle", "layout", "camera")
+
+
+def decide(obs: Observed, audio: str = "") -> Template:
+    """build() then one LLM pass for bindings and intent (skipped without an LLM key: default bindings stay)."""
+    import asyncio
+    import json
+
+    from .. import config
+    from ..clients import openrouter
+
+    t = build(obs, audio)
+    if not config.OPENROUTER_API_KEY:
+        return t
+    msgs = [{"role": "system", "content": "Reply with JSON only."},
+            {"role": "user", "content": f"{DECIDE_PROMPT}\n\n{json.dumps(compact(obs))}"}]
+    return apply_decisions(t, asyncio.run(openrouter.chat_json(msgs, Decisions)))

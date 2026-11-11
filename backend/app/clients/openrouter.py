@@ -16,6 +16,16 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"}
 
 
+def _log_usage(what: str, usage: dict | None) -> None:
+    """Tokens (and cost when OpenRouter reports it) per call, against the project the call runs for."""
+    from .. import state
+
+    pid = state.CURRENT.get()
+    if pid and usage:
+        state.event(pid, "llm_usage", {"call": what, "model": config.OPENROUTER_MODEL, **{
+            k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cost") if k in usage}})
+
+
 async def chat_json(messages: list[dict], model_cls: type[T]) -> T:
     """JSON-schema output validated with pydantic; one retry that includes the validation error."""
     msgs = list(messages)
@@ -30,7 +40,9 @@ async def chat_json(messages: list[dict], model_cls: type[T]) -> T:
             r = await c.post(URL, headers=_headers(), json=body)
         if r.status_code >= 400:
             raise RuntimeError(f"OpenRouter {r.status_code}: {r.text[:300]}")
-        text = r.json()["choices"][0]["message"]["content"] or ""
+        body_ = r.json()
+        _log_usage(model_cls.__name__, body_.get("usage"))
+        text = body_["choices"][0]["message"]["content"] or ""
         try:
             return model_cls.model_validate_json(text)
         except (ValidationError, ValueError) as e:

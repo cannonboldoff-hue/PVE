@@ -39,7 +39,9 @@ class OverlayEngine(Protocol):
     def transition(self, a: Path, b: Path, frames: int, kind: str, out: Path) -> Path: ...  # opaque, exactly frames
 
 
-GSAP = '<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>'
+# vendored with the pinned hyperframes package, copied into each project: renders must not need the network
+GSAP_FILE = config.ROOT / "overlay/hyperframes/node_modules/hyperframes/dist/vendor/npm/gsap@3.15.0/dist/gsap.min.js"
+GSAP = '<script src="gsap.min.js"></script>'
 
 
 def _secs(f: int, fps: int = FPS) -> str:
@@ -152,7 +154,7 @@ class HyperFrames:
         work.parent.mkdir(parents=True, exist_ok=True)
         video.client().hyperframes_init(work.name, output_dir=str(work.parent), template="blank", resolution="portrait",
                                         overwrite=True)
-        for a in assets:
+        for a in (GSAP_FILE, *assets):
             shutil.copy2(a, work / Path(a).name)
         (work / "index.html").write_text(page, encoding="utf-8")
         return work

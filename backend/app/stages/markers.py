@@ -33,7 +33,7 @@ def font(px: int) -> ImageFont.FreeTypeFont:
 
 
 @lru_cache(maxsize=32)
-def _base(slot: int, textured: bool, w: int, h: int) -> np.ndarray:
+def _base(slot: int, textured: bool, w: int, h: int, number: bool = True) -> np.ndarray:
     if textured:
         rng = np.random.default_rng(slot)
         n = rng.integers(0, 255, (h // 8, w // 8, 3), dtype=np.uint8)
@@ -41,6 +41,8 @@ def _base(slot: int, textured: bool, w: int, h: int) -> np.ndarray:
         img = (img.astype(np.float32) * 0.5 + np.array(colour(slot), np.float32) * 0.5).astype(np.uint8)
     else:
         img = np.full((h, w, 3), colour(slot), np.uint8)
+    if not number:
+        return img
     im = Image.fromarray(img)
     d = ImageDraw.Draw(im)
     d.text((w / 2, h / 2), str(slot), font=font(int(h * 0.3)), fill=(255, 255, 255), anchor="mm",
@@ -48,9 +50,10 @@ def _base(slot: int, textured: bool, w: int, h: int) -> np.ndarray:
     return np.asarray(im)
 
 
-def marker_frame(slot: int, local: int, textured: bool = False, w: int = W, h: int = H) -> np.ndarray:
-    """Frame `local` (source frame index) of slot `slot`'s marker clip."""
-    img = _base(slot, textured, w, h).copy()
+def marker_frame(slot: int, local: int, textured: bool = False, w: int = W, h: int = H, number: bool = True) -> np.ndarray:
+    """Frame `local` (source frame index) of slot `slot`'s marker clip. number=False for the marker pass: a big digit
+    would be read as on-screen text over the template's own captions."""
+    img = _base(slot, textured, w, h, number).copy()
     bw = max(2, round(BAR_W * w / W))
     x = int(local * BAR_SPEED * w / W) % (w - bw)
     y0, y1 = int(BAR_Y * h), int((BAR_Y + BAR_H) * h)
@@ -89,7 +92,8 @@ def encode(frames, n: int, out: Path, size: tuple[int, int], audio: bool = False
 
 
 def marker_clip(slot_no: int, frames: int, out: Path, textured: bool = False, size: tuple[int, int] = (W, H),
-                fps: int = FPS) -> Path:
+                fps: int = FPS, number: bool = True) -> Path:
     """A marker clip for one slot."""
     w, h = size
-    return encode((marker_frame(slot_no, f, textured, w, h) for f in range(frames)), frames, Path(out), size, fps=fps)
+    return encode((marker_frame(slot_no, f, textured, w, h, number) for f in range(frames)), frames, Path(out), size,
+                  fps=fps)

@@ -46,12 +46,12 @@ def ingest(path: str | Path, audio_key: str | None = None) -> ir.Source:
     return src
 
 
-def run(path: str | Path, audio_key: str | None = None, provider: str | None | bool = None
+def run(path: str | Path, audio_key: str | None = None, provider: str | None | bool = None, progress=None
         ) -> tuple[str, ir.Template, ir.Delta]:
     """ingest -> evidence -> meaning -> fusion -> template -> same-shot pass. Saves observed, template, delta.
     provider: "gemini" / "pegasus", None for config.VLM_PROVIDER, False to measure only (no video AI)."""
     from .. import evidence
-    from . import fusion, meaning, roundtrip
+    from . import fusion, meaning, requirements, roundtrip
 
     src = ingest(path, audio_key)
     ev = evidence.run_all(src.key)
@@ -64,9 +64,12 @@ def run(path: str | Path, audio_key: str | None = None, provider: str | None | b
     obs = fusion.fuse(src, ev, found, reel)
     ir.save(src.key, "observed", obs, inputs=ir.digest(ev.model_dump(mode="json")))
     audio = music.audio_path(audio_key or src.key)
-    t = extract.build(obs, audio=str(audio) if audio.exists() else "")
+    a = str(audio) if audio.exists() else ""
+    t = extract.decide(obs, a) if provider is not False else extract.build(obs, a)  # measure-only: no LLM either
+    requirements.apply(t)
     ir.save(src.key, "template", t, v=extract.VERSION, inputs=ir.digest(obs.model_dump(mode="json")))
-    rows = roundtrip.same_shot_pass(src.key)
-    delta = ir.Delta(rows=rows, coverage=roundtrip.coverage(t, ev), passed=all(r.ok for r in rows))
-    ir.save(src.key, "delta", delta)
+    # validation A: measure-only runs (provider False) check timing and coverage, not the slower marker pass
+    t, delta = roundtrip.validate(src.key, ev, tracks=None if provider is not False else [],
+                                  critic=provider is not False, provider=provider or None, progress=progress)
+    roundtrip.cleanup(src.key, keep=config.KEEP_REFS or provider is False)
     return src.key, t, delta

@@ -101,7 +101,7 @@ def render_markers(key: str) -> tuple[ir.Template, "Path"]:
         jobs += [(k + 1 + TILE_STEPS[j % len(TILE_STEPS)], need[k], Path(tp), size(ps.layout_boxes[j + 1]))
                  for j, tp in enumerate(ps.tiles)]
     with ThreadPoolExecutor(4) as pool:
-        list(pool.map(lambda a: markers.marker_clip(a[0], a[1], a[2], textured=True, size=a[3]), jobs))
+        list(pool.map(lambda a: markers.marker_clip(a[0], a[1], a[2], textured=True, size=a[3], number=False), jobs))
     final, _, _ = orchestrator.run(f"markers:{key}", plan, mk, lambda: None)
     out = mk / "render.mp4"
     shutil.copy2(final, out)
@@ -176,9 +176,14 @@ def marker_pass(key: str, tracks: list[str] | None = None) -> list[ir.DeltaRow]:
     from .analyze import ingest
 
     want = tracks or ["transitions", "text", "text_anim", "camera", "speed", "effects", "layout", "overlays"]
+    from .. import config, db
+
     t, out = render_markers(key)
     src = ingest(out)
     ev = evidence.run_all(src.key, only=want)
+    if not config.KEEP_REFS:  # the render was ingested like a reference only to be measured
+        shutil.rmtree(ir.ref_dir(src.key), ignore_errors=True)
+        db.run("DELETE FROM refs WHERE key=?", (src.key,))
     rows = []
     if "transitions" in want:
         rows += compare_transitions(t.transitions, ev.track("transitions"))
@@ -326,3 +331,122 @@ def same_shot_pass(key: str) -> list[ir.DeltaRow]:
         rows.append(ir.DeltaRow(track="audio", metric="length (s)", ref=round(v_len, 3), render=round(a_len, 3),
                                 gap=round(abs(a_len - v_len), 3), ok=abs(a_len - v_len) <= 1 / ir.FPS))
     return rows
+
+
+# ---- M11: validation A as a loop ----
+
+MAX_TEMPLATE_ROUNDS = 3
+MARKER_OK = 0.9  # share of marker-pass rows that must agree (the rest are listed on the template card)
+
+
+def score(d: ir.Delta) -> float:
+    return (sum(r.ok for r in d.rows) / len(d.rows) if d.rows else 0.0) + d.coverage
+
+
+def tiling_patches(t: ir.Template) -> list[tuple[str, int]]:
+    """Slots must tile [0, n_frames): each slot ends where the next starts, the last at n_frames."""
+    out = []
+    for k, (s, nxt) in enumerate(zip(t.slots, t.slots[1:])):
+        if s.end != nxt.start:
+            out.append((f"slots.{k}.end", nxt.start))
+    if t.slots and t.slots[-1].end != t.n_frames:
+        out.append((f"slots.{len(t.slots) - 1}.end", t.n_frames))
+    if t.slots and t.slots[0].start != 0:
+        out.append(("slots.0.start", 0))
+    return out
+
+
+def text_patches(t: ir.Template, rows: list[ir.DeltaRow]) -> list[tuple[str, int]]:
+    """A caption the render shows k frames late is moved k frames earlier (and the other way round)."""
+    out = []
+    ids = {e.id: k for k, e in enumerate(t.texts)}
+    for r in rows:
+        if r.track == "text" and not r.ok and r.metric.endswith((" start frame", " end frame")) and r.render is not None:
+            eid, what = r.metric.split(" ", 1)
+            k = ids.get(eid)
+            if k is not None:
+                field = "start" if what.startswith("start") else "end"
+                cur = getattr(t.texts[k], field)
+                out.append((f"texts.{k}.{field}", int(cur - (r.render - r.ref))))
+    return out
+
+
+def apply_patch(t: ir.Template, path: str, value) -> None:
+    obj, parts = t, path.split(".")
+    for p in parts[:-1]:
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    setattr(obj, parts[-1], value)
+
+
+def omissions(key: str, t: ir.Template, provider=None) -> list[str]:
+    """The video AI watches the reference with the template summary and names what the template leaves out."""
+    from .analyze import proxy_path
+    from .meaning import Session
+
+    summary = {"slots": len(t.slots), "transitions": [x.type.value for x in t.transitions],
+               "texts": [e.text.value for e in t.texts], "effects": [e.type.value for e in t.effects],
+               "overlays": [o.kind.value for o in t.overlays], "layouts": [s.layout.value for s in t.slots],
+               "camera": [s.camera.value for s in t.slots]}
+    schema = {"type": "object", "properties": {"missing": {"type": "array", "items": {"type": "string"}}},
+              "required": ["missing"]}
+    try:
+        with Session(key, proxy_path(key), provider) as s:
+            r = s.ask("This template was measured from the video: " + str(summary) + ". List visible editing "
+                      "features (effects, stickers, text, transitions, motion, layout) that it does not mention. "
+                      "Empty list if nothing is missing.", schema)
+        return [str(x) for x in r.get("missing", [])][:20]
+    except Exception as e:  # no provider configured or the call failed: the critic is advisory
+        return [f"(omission check not run: {str(e)[:120]})"]
+
+
+def validate(key: str, ev: ir.Evidence, tracks: list[str] | None = None, critic: bool = True,
+             provider=None, progress=None) -> tuple[ir.Template, ir.Delta]:
+    """Same-shot pass, marker pass, coverage, omission critic; typed patches applied by code; up to
+    MAX_TEMPLATE_ROUNDS; the best-scoring template is kept and saved with its delta."""
+    say = progress or (lambda m: None)
+    t = ir.load(key, "template", ir.Template)
+    best: tuple[ir.Template, ir.Delta] | None = None
+    for rnd in range(MAX_TEMPLATE_ROUNDS):
+        say(f"Checking the template (round {rnd + 1}): rendering it back and measuring the result…")
+        rows: list[ir.DeltaRow] = []
+        tiles = not tiling_patches(t)
+        if tiles:
+            rows += same_shot_pass(key)
+        else:
+            rows.append(ir.DeltaRow(track="timing", metric="slots tile the reel", ref=t.n_frames,
+                                    render=[(s.start, s.end) for s in t.slots], gap=1, ok=False))
+        timing_ok = tiles and all(r.ok for r in rows)
+        marker = marker_pass(key, tracks) if timing_ok and tracks != [] else []
+        rows += marker
+        cov = coverage(t, ev)
+        ok_marker = sum(r.ok for r in marker) / len(marker) if marker else 1.0
+        d = ir.Delta(rows=rows, coverage=cov, passed=timing_ok and cov >= 1.0 and ok_marker >= MARKER_OK)
+        if best is None or score(d) > score(best[1]):
+            best = (t.model_copy(deep=True), d)
+        if d.passed:
+            break
+        fixes = tiling_patches(t) or text_patches(t, rows)
+        if not fixes:
+            break
+        for path, value in fixes:
+            apply_patch(t, path, value)
+        ir.save(key, "template", t)
+    t, d = best
+    if critic:
+        t.narrative["omissions"] = omissions(key, t, provider)
+    ir.save(key, "template", t)
+    ir.save(key, "delta", d)
+    return t, d
+
+
+def cleanup(key: str, keep: bool) -> None:
+    """After validation: mark the reference validated; drop the proxy and the renders unless kept for development."""
+    from .. import db
+    from .analyze import proxy_path
+
+    db.run("UPDATE refs SET validated=1 WHERE key=?", (key,))
+    if keep:
+        return
+    proxy_path(key).unlink(missing_ok=True)
+    for sub in ("rt", "mk", "frames"):
+        shutil.rmtree(ir.ref_dir(key) / sub, ignore_errors=True)

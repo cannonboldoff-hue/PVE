@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from collections.abc import Coroutine
 from pathlib import Path
 
@@ -25,8 +26,11 @@ def spawn(pid: str, coro: Coroutine, stage: str) -> None:
         old.cancel()
 
     async def wrapper():
+        state.CURRENT.set(pid)
+        t0, ok = time.monotonic(), False
         try:
             await coro
+            ok = True
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -38,6 +42,8 @@ def spawn(pid: str, coro: Coroutine, stage: str) -> None:
                 pass
             msgs.text(conv, f"Something went wrong in {stage.lower().replace('_', ' ')}: {e}\n\nSay \"retry\" to try again.")
             msgs.changed(conv)
+        finally:
+            state.event(pid, "stage_time", {"stage": stage, "seconds": round(time.monotonic() - t0, 2), "ok": ok})
 
     TASKS[pid] = asyncio.create_task(wrapper())
 
@@ -65,7 +71,8 @@ async def run_analyze(pid: str, file: Path | None = None) -> None:
     conv = p["conv_id"]
     msgs.text(conv, "Looking at the reference Reel…")
     try:
-        key, analysis = await asyncio.to_thread(reference.analyze, p["ref_url"], work(pid) / "ref_tmp", file)
+        key, analysis = await asyncio.to_thread(reference.analyze, p["ref_url"], work(pid) / "ref_tmp", file,
+                                                lambda m: (msgs.text(conv, m), msgs.changed(conv)))
     except reference.DownloadFailed as e:
         db.update("projects", pid, error={"stage": "ANALYZING", "needs_file": True, "message": str(e)})
         msgs.text(conv, "I couldn't download that link (Instagram and others often block it). "
@@ -74,6 +81,8 @@ async def run_analyze(pid: str, file: Path | None = None) -> None:
         msgs.changed(conv)
         return
     brief_mod.save_template(key, analysis)
+    if analysis.get("validation"):
+        msgs.card(conv, "template", pid)  # what the round trip proved, what was downgraded, what needs a confirm
     await run_brief(pid, key, analysis)
 
 
@@ -235,7 +244,8 @@ async def run_production(pid: str, rebuild: bool = True) -> None:
             state.transition(pid, "VERIFYING")
         msgs.text(conv, f"Draft v{n} is rendered ({hits} step(s) reused from cache). Checking it now…")
         msgs.card(conv, "video", pid)
-        judge, tech, content = await verifier.verify(plan, ddir / "draft.mp4", dur, p["brief"], ref)
+        judge, tech, content = await verifier.verify(plan, ddir / "draft.mp4", dur, p["brief"], ref,
+                                                     brief_mod.load_ir(p["reference_id"]) if plan.n_frames else None)
         report = {**judge.model_dump(), "tech": tech, "content": content, "round": rounds, "draft": n}
         db.run("INSERT INTO drafts(project_id,n,path,plan,verifier,created) VALUES(?,?,?,?,?,?)",
                (pid, n, str(ddir / "draft.mp4"), plan.model_dump_json(), json.dumps(report), db.now()))

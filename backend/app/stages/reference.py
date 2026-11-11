@@ -77,11 +77,11 @@ def _pacing(t: ir.Template) -> str:
     return f"{len(lens)} shots, average {sum(lens) / len(lens):.1f} s (shortest {min(lens):.1f} s, longest {max(lens):.1f} s)"
 
 
-def _analyze_file(path: Path, audio_key: str) -> dict:
+def _analyze_file(path: Path, audio_key: str, progress=None) -> dict:
     from . import analyze as pipeline
     from .fusion import Observed
 
-    ref_key, t, delta = pipeline.run(path, audio_key)
+    ref_key, t, delta = pipeline.run(path, audio_key, progress=progress)
     obs = ir.load(ref_key, "observed", Observed)
     # legacy per-shot fields for the ShotSpec adapter: the typed meaning plus the style notes styles.py parses
     shots = [{**style, "description": s.function.value, "subject": s.subject.value, "action": s.action.value,
@@ -94,7 +94,7 @@ def _analyze_file(path: Path, audio_key: str) -> dict:
             "validation": {"passed": delta.passed, "rows": [r.model_dump(mode="json") for r in delta.rows]}}
 
 
-def analyze(url: str | None, workdir: Path, file: Path | None = None) -> tuple[str, dict]:
+def analyze(url: str | None, workdir: Path, file: Path | None = None, progress=None) -> tuple[str, dict]:
     """Returns (cache key, analysis). Raises DownloadFailed when the link cannot be fetched and no file given."""
     key = cache_key(url) if url else None
     if key and (hit := lookup(key)) and hit.get("v") == ANALYSIS_VERSION:
@@ -108,7 +108,7 @@ def analyze(url: str | None, workdir: Path, file: Path | None = None) -> tuple[s
         if (hit := lookup_fp(fp)) and not key and hit[1].get("v") == ANALYSIS_VERSION:
             return hit
         key = key or f"file:{fp[:16]}"
-        analysis = _analyze_file(path, key)
+        analysis = _analyze_file(path, key, progress)
         db.run("INSERT OR REPLACE INTO reference_cache(key,platform,fingerprint,analysis,created) VALUES(?,?,?,?,?)",
                (key, key.split(":")[0], fp, json.dumps(analysis), db.now()))
         return key, analysis

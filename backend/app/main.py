@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from . import actions, agent, config, db, msgs, pipeline, state
 from .clients import twelvelabs, video
 from .models import Brief
+from .stages import brief as brief_mod
 from .stages import plan as plan_mod
 
 
@@ -113,7 +114,7 @@ def _summary(p: dict) -> dict | None:
         return None
     assets = {a["id"]: a for a in db.q("SELECT * FROM assets")}
     brief = Brief(**p["brief"])
-    plan = plan_mod.build(p["shots"], p["matches"], assets, None, brief.captions)
+    plan = plan_mod.build(p["shots"], p["matches"], assets, None, brief.captions, brief_mod.load_ir(p["reference_id"]))
     by = {m["shot_id"]: m for m in p["matches"]}
     rows = [{"shot_id": s["shot_id"], "purpose": s["purpose"], "skipped": s.get("skipped", False),
              "clip": assets.get((by.get(s["shot_id"]) or {}).get("asset_id"), {}).get("filename"),
@@ -129,7 +130,33 @@ def get_project(pid: str):
     p["progress"] = db.q("SELECT node,status,cached FROM graph_runs WHERE project_id=? ORDER BY rowid", (pid,))
     p["assets"] = db.q("SELECT id,filename,kind,status,duration,error FROM assets ORDER BY created")
     p["summary"] = _summary(p)
+    p["template_report"] = _template_report(p)
     return p
+
+
+def _template_report(p: dict) -> dict | None:
+    """What validation A proved, what the renderer could not reproduce, and what needs a confirm."""
+    row = db.one("SELECT template, delta FROM templates WHERE key=?", (p["reference_id"],)) if p["reference_id"] else None
+    if not row or not row.get("template"):
+        return None
+    t = row["template"]
+
+    def get(path):
+        obj = t
+        for part in path.split("."):
+            obj = obj[int(part)] if part.isdigit() else obj[part]
+        return obj
+
+    losses = [x["loss"] for x in t["transitions"] + t["effects"] if x.get("loss")]
+    confirm = []
+    for path in t.get("low_conf", []):
+        try:
+            f = get(path)
+            confirm.append({"path": path, "value": f["value"], "note": f.get("raw"), "conf": f.get("conf")})
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+    return {"delta": row.get("delta"), "losses": sorted(set(losses)), "confirm": confirm,
+            "omissions": t.get("narrative", {}).get("omissions", [])}
 
 
 class Changes(BaseModel):
@@ -184,6 +211,15 @@ async def confirm_brief(pid: str): return _ok(actions.confirm_brief(pid))
 
 @app.post("/api/projects/{pid}/confirm-shots")
 async def confirm_shots(pid: str): return _ok(actions.confirm_shots(pid))
+
+
+class FieldConfirm(BaseModel):
+    path: str
+    value: str | None = None
+
+
+@app.post("/api/projects/{pid}/confirm-template-field")
+async def confirm_template_field(pid: str, b: FieldConfirm): return _ok(actions.confirm_template_field(pid, b.path, b.value))
 
 
 @app.post("/api/projects/{pid}/edit-shot")

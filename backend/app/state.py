@@ -1,3 +1,4 @@
+import contextvars
 import json
 
 from . import db
@@ -53,6 +54,10 @@ def transition(project_id: str, new: str, error: dict | None = None) -> dict:
 
 def fail(project_id: str, stage: str, message: str) -> None:
     transition(project_id, "FAILED", {"stage": stage, "message": message})
+
+
+# the project a stage runs for; copied into asyncio tasks and to_thread workers, so deep calls can log against it
+CURRENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("pve_project", default=None)
 
 
 def event(project_id: str, type_: str, data: dict | None = None) -> None:

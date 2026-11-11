@@ -10,7 +10,7 @@ import numpy as np
 from .. import ir
 from ..stages.compare import box_iou, text_similarity
 
-NAME, VERSION, DEPS = "text", 5, []
+NAME, VERSION, DEPS = "text", 7, []
 SAMPLE_EVERY = 3  # 10 samples per second; lower finds shorter flashes of text, higher is faster
 OCR_LONG = 640  # long side the OCR sees; smaller misses small captions, larger is slower (0.33 s vs 0.55 s at 960)
 SAME_FRAME = 4  # max gray difference (0..255) at which a sample reuses the previous sample's OCR
@@ -23,6 +23,7 @@ LINE_GAP = 0.8  # lines closer than this many line heights, with the same timing
 SAME_TIMING = 3  # frames
 # a row/column is glyph when it holds this share of the densest one's glyph pixels (rows lower: ascenders are sparse)
 INK_DENSE_ROW, INK_DENSE_COL = 0.04, 0.08
+BOX_FLAT = 12.0  # colour spread (std, 0..255) below which a cluster is a flat caption box
 
 _lock = threading.Lock()
 
@@ -110,6 +111,31 @@ def link(samples: dict[int, list[tuple[ir.Box, str, float]]]) -> list[list[tuple
     return tracks
 
 
+def _norm(t: str) -> str:
+    return t.lower().replace(" ", "")
+
+
+def split_changes(track: list) -> list[list]:
+    """A track whose string changes and stays changed is two events (one caption replaced by the next in the same
+    place). Single-sample changes are OCR flicker; a string that only grows is typewriter: both stay one event."""
+    groups: list[list] = []
+    for d in track:
+        if groups and _norm(groups[-1][-1][2]) == _norm(d[2]):
+            groups[-1].append(d)
+        else:
+            groups.append([d])
+    merged: list[list] = []
+    for g in groups:
+        if merged and (len(g) < 2 or _norm(g[0][2]).startswith(_norm(merged[-1][-1][2])) or
+                       _norm(merged[-1][-1][2]).startswith(_norm(g[0][2]))):
+            merged[-1] += g  # flicker or growth: same event
+        elif merged and len(merged[-1]) < 2:
+            merged[-1] += g  # the previous piece was flicker
+        else:
+            merged.append(g)
+    return merged
+
+
 def _present(img: np.ndarray, box: ir.Box, text: str) -> bool:
     return any(box_iou(b, box) > 0.2 and (text_similarity(t, text) >= LINK_SIM or _linkable((b, t), (box, text)))
                for b, t, _ in ocr(img))
@@ -179,7 +205,9 @@ def measure_style(img: np.ndarray, box: ir.Box, lines: int = 1) -> dict:
     if not rare:
         return style
     # a rare cluster covering most of the box is a filled background box; text is drawn on it
-    boxy = [j for j in rare if share_in[j] > 0.5]
+    spread = [float(inner[labels == j].std(axis=0).max()) if (labels == j).any() else 999.0 for j in range(k)]
+    # a filled caption box is one flat colour; textured footage behind big glyphs only looks "rare" outside
+    boxy = [j for j in rare if share_in[j] > 0.5 and spread[j] < BOX_FLAT and share_out[j] < 0.05]
     lab = labels.reshape(y1 - max(0, y0), x1 - max(0, x0))
     ground = boxy[0] if boxy else int(np.argmax(share_out))  # what the glyphs sit on
     if boxy:
@@ -241,7 +269,7 @@ def run(ctx) -> list[ir.Item]:
             samples[f] = ocr(frames[f])
             prev = (f, g.astype(np.int16))
     events = []
-    for tr in link(samples):
+    for tr in (piece for t in link(samples) for piece in split_changes(t)):
         if tr[-1][0] - tr[0][0] + 1 < MIN_TEXT_FRAMES - SAMPLE_EVERY:
             continue
         start, end = refine(ctx.proxy, tr, size, src.n_frames)

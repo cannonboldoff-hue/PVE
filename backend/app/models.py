@@ -122,7 +122,7 @@ class Match(BaseModel):
     asset_id: str | None = None
     start: float = 0
     end: float = 0
-    label: Literal["exact", "similar", "missing"] = "missing"
+    label: Literal["exact", "similar", "adaptable", "missing"] = "missing"  # adaptable: fits after crop, speed or motion
     extra_assets: list[str] = Field(default_factory=list)  # more tiles for a collage shot
     reason: str = ""
     instruction: str = ""  # filming instruction when missing

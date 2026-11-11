@@ -6,6 +6,7 @@ Timing never comes from here: slot windows are the measured cuts."""
 import json
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import get_args
@@ -15,6 +16,8 @@ from pydantic import BaseModel, Field
 from .. import config, ir
 from ..clients import ff
 
+RETRIES = 3  # rate-limit retries per call
+BACKOFF = 5.0  # seconds, doubled each retry
 PROMPT_VERSION = 2  # 2: text event roles and font class
 WORKERS = 4
 NO_ANSWER_CONF = 0.0
@@ -150,6 +153,19 @@ class Session:
             twelvelabs.delete_asset(self._asset)
 
     def ask(self, prompt: str, schema: dict, start: int | None = None, end: int | None = None) -> dict:
+        """One provider call, retried with backoff when the provider says it is rate limited."""
+        for attempt in range(RETRIES + 1):
+            try:
+                return self._ask(prompt, schema, start, end)
+            except Exception as e:
+                text = str(e).lower()
+                if attempt == RETRIES or not any(k in text for k in ("429", "rate", "quota", "resource_exhausted",
+                                                                    "too many")):
+                    raise
+                time.sleep(BACKOFF * 2 ** attempt)
+        raise AssertionError("unreachable")
+
+    def _ask(self, prompt: str, schema: dict, start: int | None = None, end: int | None = None) -> dict:
         if self.provider == "gemini":
             from ..clients import gemini
 

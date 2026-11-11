@@ -56,3 +56,16 @@ def test_ass_timing_is_frame_exact():
         h, m, s = textlayer.ts(f).split(":")
         t = int(h) * 3600 + int(m) * 60 + float(s)
         assert (f - 1) / 30 < t <= f / 30 + 1e-9, (f, t)
+
+
+def test_track_splits_when_the_caption_is_replaced():
+    from app.evidence.text import split_changes
+
+    def d(f, t):
+        return (f, None, t, 0.9)
+
+    replaced = [d(0, "Caption 1"), d(3, "Caption 1"), d(6, "Captlon 1"), d(9, "Caption 1"), d(12, "Caption 2"),
+                d(15, "Caption 2")]
+    assert [[x[0] for x in g] for g in split_changes(replaced)] == [[0, 3, 6, 9], [12, 15]]  # 6 is OCR flicker
+    growing = [d(0, "Ca"), d(3, "Capt"), d(6, "Caption"), d(9, "Caption 1")]
+    assert len(split_changes(growing)) == 1  # typewriter

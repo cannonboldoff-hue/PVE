@@ -146,7 +146,8 @@ async def fill_shots(template: list[ShotSpec], brief: dict, ir_template=None) ->
     for t, c in zip(template, out.shots):
         s = t.model_copy(update=c.model_dump())
         if t.texts:
-            s.texts = [{"id": x["id"], "text": new.get(x["id"], c.text or x["text"])} for x in t.texts]
+            s.texts = [{"id": x["id"], "text": new.get(x["id"], (c.text or x["text"])[: limits.get(x["id"], 10**6)])}
+                       for x in t.texts]  # no word for an event: the slot's caption, cut to the event's limit
             s.text = " / ".join(x["text"].replace("\n", " ") for x in s.texts)
         filled.append(s)
     return filled

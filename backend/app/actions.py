@@ -214,3 +214,38 @@ def upload_status(pid: str) -> list[dict]:
     _p(pid)
     return [{"id": a["id"], "filename": a["filename"], "kind": a["kind"], "status": a["status"],
              "duration": a["duration"], "error": a["error"]} for a in db.q("SELECT * FROM assets ORDER BY created")]
+
+
+def _field(t, path: str):
+    obj = t
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj
+
+
+def confirm_template_field(pid: str, path: str, value=None) -> str:
+    """The user confirms (value None) or corrects a low-confidence template field: it becomes source "user",
+    confidence 1 and leaves the confirm list. Only labelled values (F fields) can be set, never timing."""
+    from . import ir
+
+    p = _p(pid)
+    t = brief_mod.load_ir(p["reference_id"])
+    if t is None:
+        raise ActionError("This project has no measured template.")
+    try:
+        f = _field(t, path)
+        parent, last = _field(t, path.rsplit(".", 1)[0]), path.rsplit(".", 1)[1]
+    except (AttributeError, IndexError, ValueError) as e:
+        raise ActionError(f"Unknown template field {path}") from e
+    if not isinstance(f, ir.F):
+        raise ActionError(f"{path} is not a labelled field")
+    try:
+        new = f.__class__(**{**f.model_dump(), "value": f.value if value is None else value, "source": "user",
+                             "conf": 1.0})
+    except ValidationError as e:
+        raise ActionError(f"Not a valid value for {path}: {e.errors()[0]['msg']}") from e
+    setattr(parent, last, new)
+    t.low_conf = [x for x in t.low_conf if x != path]
+    db.run("UPDATE templates SET template=? WHERE key=?", (t.model_dump_json(), p["reference_id"]))
+    ir.save(t.key, "template", t)
+    return f"Saved {path} = {new.value}."

@@ -20,13 +20,17 @@ REEL_CUTS = [60, 120]  # 3 shots of 2 s at 30 fps
 
 
 def shot(i, subject):
-    return ShotContent(purpose=f"p{i}", subject=subject, action="act", text=f"Caption {i}")
+    return ShotContent(purpose=f"p{i}", subject=subject, action="act", text=f"S{i}")  # short: fits a 1-digit caption slot
 
 
 class Script:
     judge_calls = 0
 
     async def chat_json(self, messages, cls):
+        if cls.__name__ == "Decisions":  # template bindings: keep the defaults, name the first slot the hook
+            from app.stages.extract import Decisions, SlotIntent
+
+            return Decisions(slots=[SlotIntent(slot="s01", role="hook", function="opens the reel")])
         if cls is Brief:
             return Brief(topic="bakery", target_length=6)
         if cls is ShotContentList:
@@ -59,7 +63,7 @@ def client(tmp_path_factory):
     mp.setattr(openrouter, "chat_stream", s.chat_stream)
 
     reel = tmp_path_factory.mktemp("ref") / "reel.mp4"
-    make_reel(SynthSpec(n_frames=180, cuts=REEL_CUTS, textured=True), reel)
+    make_reel(SynthSpec(n_frames=180, cuts=REEL_CUTS), reel)  # flat colour: OCR boxes on heavy noise are unreliable
 
     def fake_download(url, dest):
         dest.mkdir(parents=True, exist_ok=True)
@@ -108,8 +112,9 @@ def wait(c, pid, want, timeout=180):
 
 def upload(c, pid, tmp_path, name, shot_id=None):
     f = tmp_path / name
+    hue = sum(map(ord, name)) * 47 % 360  # different-looking clips, so the verifier can see each cut
     ff("-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
-       "-pix_fmt", "yuv420p", "-shortest", str(f))
+       "-vf", f"hue=h={hue}", "-pix_fmt", "yuv420p", "-shortest", str(f))
     data = {"project_id": pid, "kind": "clip", **({"shot_id": str(shot_id)} if shot_id else {})}
     r = c.post("/api/assets", data=data, files={"file": (name, f.read_bytes(), "video/mp4")})
     assert r.status_code == 200, r.text
@@ -135,7 +140,14 @@ def test_full_flow(client, tmp_path):
     t = brief_mod.load_ir("youtube:abcdefghijk")
     assert t.cuts() == REEL_CUTS and t.n_frames == 180  # measured, not from the model
     delta = ir.Delta.model_validate(db.one("SELECT delta FROM templates WHERE key=?", ("youtube:abcdefghijk",))["delta"])
-    assert delta.passed
+    assert delta.passed and any(r.track == "text" for r in delta.rows), [r for r in delta.rows if not r.ok]  # marker pass ran
+    rep = c.get(f"/api/projects/{pid}").json()["template_report"]
+    assert rep["delta"]["passed"] and "template" in [m["card"]["type"] for m in
+                                                     c.get(f"/api/conversations/{cid}/messages").json() if m["card"]]
+    # the confirm round trip: a labelled field set by the user is stored with source "user"
+    assert c.post(f"/api/projects/{pid}/confirm-template-field", json={"path": "slots.0.role", "value": "payoff"}).status_code == 200
+    assert brief_mod.load_ir("youtube:abcdefghijk").slots[0].role.model_dump()["source"] == "user"
+    assert c.post(f"/api/projects/{pid}/confirm-template-field", json={"path": "slots.0.start", "value": "3"}).status_code == 400
 
     # clips first, then confirm brief -> shot list
     upload(c, pid, tmp_path, "a.mp4")
@@ -169,7 +181,7 @@ def test_full_flow(client, tmp_path):
     assert c.post(f"/api/projects/{pid}/approve").status_code == 200
     p = wait(c, pid, {"FINAL"})
     assert p["approved"] == 1 and p["draft_n"] == 2  # draft 1 flagged REPAIR, repaired, draft 2 PASS
-    assert p["verifier"]["verdict"] == "PASS"
+    assert p["verifier"]["verdict"] == "PASS", {k: v for k, v in p["verifier"]["tech"].items() if not v["ok"]}
     assert c.get(f"/api/projects/{pid}/video").status_code == 200
     # the render has the reference's length and the reference audio, sample-aligned
     assert ffc.count_frames(p["final_path"]) == 180
