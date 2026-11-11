@@ -55,13 +55,14 @@ def run(path: str | Path, audio_key: str | None = None, provider: str | None | b
 
     src = ingest(path, audio_key)
     ev = evidence.run_all(src.key)
-    slots, _ = fusion.slots_from_cuts(src, ev)
-    found, reel = [], {}
+    slots, trans = fusion.slots_from_cuts(src, ev)
+    found, reel, named = [], {}, []
     if provider is not False:
         with meaning.Session(src.key, Path(path), provider or None) as s:
             found = meaning.describe_slots(s, slots, ev)
             reel = meaning.describe_reel(s, slots)
-    obs = fusion.fuse(src, ev, found, reel)
+            named = meaning.describe_transitions(s, trans, src.n_frames)
+    obs = fusion.fuse(src, ev, found, reel, named)
     ir.save(src.key, "observed", obs, inputs=ir.digest(ev.model_dump(mode="json")))
     audio = music.audio_path(audio_key or src.key)
     a = str(audio) if audio.exists() else ""

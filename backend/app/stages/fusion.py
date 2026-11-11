@@ -5,13 +5,18 @@ from pydantic import BaseModel, Field
 
 from .. import ir
 from ..ir import F
-from .meaning import VOCAB, SlotMeaning
+from .meaning import VOCAB, SlotMeaning, TransitionMeaning
 
 # field -> evidence track that owns it; fields not listed are owned by the model.
 # timing and geometry always come from evidence; these are the semantic fields a track can also measure.
 EVIDENCE_OWNER = {"media": "still", "camera": "camera", "layout": "layout"}
 CONFLICT_FACTOR = 0.5  # owner's conf is multiplied by this when the other source disagrees
-UNMEASURED_FACTOR = 0.7  # evidence-owned field with no measurement yet: the model's value, trusted less
+UNMEASURED_FACTOR = 0.7
+LAYER_CONF = 0.4  # ceiling for a layer only the video AI saw
+LAYER_LOSS = {"shape_mask": "shape mask not rendered: the new footage fills the frame",
+              "cutout": "cutout not rendered: the new footage keeps its background",
+              "moving_layer": "moving layer not rendered", "other": "layer not rendered"}
+SURE_CLASS = 0.8  # a measured transition class at or above this keeps its name over the model's  # evidence-owned field with no measurement yet: the model's value, trusted less
 
 
 class Conflict(BaseModel):
@@ -34,6 +39,7 @@ class Observed(BaseModel):
     slots: list[ir.Slot]
     transitions: list[ir.Transition] = Field(default_factory=list)
     texts: list[ir.TextEvent] = Field(default_factory=list)
+    layers: list[ir.Layer] = Field(default_factory=list)
     effects: list[ir.Effect] = Field(default_factory=list)
     overlays: list[ir.Overlay] = Field(default_factory=list)
     narrative: dict = Field(default_factory=dict)
@@ -62,6 +68,62 @@ def slots_from_cuts(source: ir.Source, ev: ir.Evidence) -> tuple[list[ir.Slot], 
                                                              evidence=[i.id, *i.data.get("cuts", [])]),
                                    render=render, loss=loss))
     return slots, trans
+
+
+def name_transitions(trans: list[ir.Transition], named: list[TransitionMeaning] | None) -> list[Conflict]:
+    """Window from evidence, name from the model unless the measured class is sure and different. 'cut' and
+    'other' from the model never replace a measured gradual class (the model's word stays in the conflict)."""
+    from ..render import capabilities
+
+    by = {(m.after_slot, m.start, m.end): m for m in named or [] if m.answer.confidence > 0}
+    out = []
+    for k, t in enumerate(trans):
+        m = by.get((t.after_slot, t.start, t.end))
+        if m is None or m.answer.value == t.type.value:
+            if m is not None:
+                t.type.conf = max(t.type.conf, m.answer.confidence)
+            continue
+        ans, measured = m.answer, t.type
+        if measured.conf >= SURE_CLASS or ans.value in ("cut", "other"):
+            out.append(Conflict(path=f"transitions.{k}.type", owner=measured.source, kept=measured.value,
+                                other=ans.value if ans.value != "other" else ans.note, other_source=m.provider,
+                                evidence=measured.evidence))
+            continue
+        out.append(Conflict(path=f"transitions.{k}.type", owner=m.provider, kept=ans.value, other=measured.value,
+                            other_source=measured.source, evidence=measured.evidence))
+        t.type = F[ir.TransitionType](value=ans.value, raw={"note": ans.note, "measured": measured.value,
+                                                            "signals": measured.raw}, conf=ans.confidence,
+                                      source=m.provider, evidence=measured.evidence)
+        t.render, t.loss = capabilities.transition(ans.value)
+    return out
+
+
+def _box(raw) -> ir.Box | None:
+    try:
+        x, y, w, h = (min(1.0, max(0.0, float(raw[k]))) for k in "xywh")
+    except (KeyError, TypeError, ValueError):
+        return None
+    return ir.Box(x=x, y=y, w=min(w, 1 - x), h=min(h, 1 - y)) if w > 0 and h > 0 else None
+
+
+def layers_from_meaning(meaning: list[SlotMeaning] | None) -> list[ir.Layer]:
+    """Masks, cutouts and moving layers from the video AI: a box per end of the shot, low confidence, a loss."""
+    out = []
+    for m in meaning or []:
+        for x in m.layers:
+            box = _box(x.get("box"))
+            if box is None:
+                continue
+            end = _box(x.get("end_box")) or box
+            kind = x.get("kind") if x.get("kind") in get_args(ir.LayerKind) else "other"
+            conf = min(LAYER_CONF, max(0.0, float(x.get("confidence") or 0.5)))
+            out.append(ir.Layer(id=f"l{len(out) + 1:02d}", start=m.start, end=m.end, shape=str(x.get("shape") or ""),
+                                kind=F[ir.LayerKind](value=kind, raw=x.get("note") or x.get("kind"), conf=conf,
+                                                     source=m.provider),
+                                keys=[ir.Key(frame=m.start, box=box), *([ir.Key(frame=m.end - 1, box=end)]
+                                                                       if end != box else [])],
+                                loss=LAYER_LOSS[kind]))
+    return out
 
 
 def _measured(ev: ir.Evidence, track: str, slot: ir.Slot) -> ir.Item | None:
@@ -135,16 +197,17 @@ def effects_from_evidence(ev: ir.Evidence) -> list[ir.Effect]:
 
 
 def fuse(source: ir.Source, ev: ir.Evidence, meaning: list[SlotMeaning] | None = None,
-         reel: dict | None = None) -> Observed:
+         reel: dict | None = None, named: list[TransitionMeaning] | None = None) -> Observed:
     slots, trans = slots_from_cuts(source, ev)
-    obs = Observed(source=source, slots=slots, transitions=trans, texts=texts_from_evidence(ev, meaning),
+    renamed = name_transitions(trans, named)
+    obs = Observed(source=source, slots=slots, transitions=trans, texts=texts_from_evidence(ev, meaning), layers=layers_from_meaning(meaning),
                    effects=effects_from_evidence(ev),
                    overlays=[ir.Overlay(id=f"o{k + 1:02d}", kind=F[ir.OverlayKind](value=i.data["kind"], raw=i.data,
                                                                                     conf=i.conf, source="overlays",
                                                                                     evidence=[i.id]),
                                         start=i.start, end=i.end, keys=[ir.Key(frame=i.start, box=ir.Box(**i.data["box"]))])
                              for k, i in enumerate(ev.track("overlays"))],
-                   narrative={k: v for k, v in (reel or {}).items() if k != "error"})
+                   narrative={k: v for k, v in (reel or {}).items() if k != "error"}, conflicts=renamed)
     by_slot = {m.slot: m for m in meaning or []}
     for k, slot in enumerate(slots):
         m = by_slot.get(slot.id)

@@ -18,7 +18,8 @@ from ..clients import ff
 
 RETRIES = 3  # rate-limit retries per call
 BACKOFF = 5.0  # seconds, doubled each retry
-PROMPT_VERSION = 2  # 2: text event roles and font class
+PROMPT_VERSION = 3  # 2: text event roles and font class; 3: masks, cutouts, moving layers
+TRANS_PAD = 30  # frames of context each side of a transition window (one second)
 WORKERS = 4
 NO_ANSWER_CONF = 0.0
 
@@ -49,6 +50,8 @@ def _answer_schema(vocab) -> dict:
 
 # no "enum": not every provider accepts it in a response schema; the vocabulary is in the descriptions and prompt
 TEXT_ROLES = get_args(ir.TextRole)
+BOX = {"type": "object", "description": "x, y, w, h as shares of the frame (0..1, top-left origin)",
+       "properties": {k: {"type": "number"} for k in "xywh"}}
 FONT_CLASSES = ("sans", "serif", "script", "display", "mono")
 SLOT_SCHEMA = {
     "type": "object",
@@ -58,7 +61,11 @@ SLOT_SCHEMA = {
                        "id": {"type": "string"},
                        "role": {"type": "string", "description": "one of: " + ", ".join(TEXT_ROLES)},
                        "font_class": {"type": "string", "description": "one of: " + ", ".join(FONT_CLASSES)},
-                       "anim_note": {"type": "string"}}}}},
+                       "anim_note": {"type": "string"}}}},
+                   "layers": {"type": "array", "items": {"type": "object", "properties": {
+                       "kind": {"type": "string", "description": "one of: " + ", ".join(get_args(ir.LayerKind))},
+                       "shape": {"type": "string"}, "box": BOX, "end_box": BOX, "note": {"type": "string"},
+                       "confidence": {"type": "number"}}}}},
     "required": list(VOCAB),
 }
 REEL_SCHEMA = {
@@ -81,11 +88,19 @@ SLOT_PROMPT = (
       "animates in), color_look and, for a collage, tiles / background / style. For each measured text event listed "
       "in the facts, return `texts` with its id, its role (" + ", ".join(TEXT_ROLES) + "), the font_class of its "
       "lettering (" + ", ".join(FONT_CLASSES) + ") and anim_note: how it appears (pop, slide, typewriter, word "
-      "highlight, fade...).")
+      "highlight, fade...). If the footage is shown through a shape (shape_mask), a subject is cut out from its background (cutout), or a picture layer moves across the frame (moving_layer), list each in `layers` with its shape, box at the start of the shot, end_box at the end, a note and confidence; leave `layers` empty otherwise.")
 REEL_PROMPT = (
     "This is a vertical short-form video cut into {n} shots at these times (seconds): {cuts}. Describe its story: the "
     "hook, the arc, the payoff and the call to action, its overall style, and how shots relate to each other "
     "(setup/payoff, before/after, list items). Shots are numbered from 1.")
+
+TRANS_VOCAB = get_args(ir.TransitionType)
+TRANS_SCHEMA = _answer_schema(TRANS_VOCAB)
+TRANS_PROMPT = (
+    "This clip of a vertical short-form video holds the change from one shot to the next{window}. The change runs "
+    "from {a:.2f} s to {b:.2f} s; frame analysis classes it as '{kind}'. Name the transition: value one of "
+    + ", ".join(TRANS_VOCAB) + " (direction is where the new shot or the edge travels; use 'other' and explain in the "
+    "note if none fits), a short note on what you see, and confidence 0..1.")
 
 
 class Answer(BaseModel):
@@ -102,16 +117,26 @@ class SlotMeaning(BaseModel):
     fields: dict[str, Answer] = Field(default_factory=dict)
     style: dict = Field(default_factory=dict)
     texts: list[dict] = Field(default_factory=list)  # [{id, role, font_class, anim_note}] for measured text events
+    layers: list[dict] = Field(default_factory=list)  # [{kind, shape, box, end_box, note, confidence}]
     error: str = ""
 
 
-def normalise(field: str, raw: dict | None) -> Answer:
+class TransitionMeaning(BaseModel):
+    after_slot: str
+    start: int
+    end: int
+    provider: str
+    answer: Answer
+    error: str = ""
+
+
+def normalise(field: str, raw: dict | None, vocab: tuple[str, ...] | None = None) -> Answer:
+    vocab = vocab or VOCAB.get(field)
     if not isinstance(raw, dict) or not str(raw.get("value", "")).strip():
-        return Answer(value="other" if VOCAB.get(field) else "", note="no answer", confidence=NO_ANSWER_CONF)
+        return Answer(value="other" if vocab else "", note="no answer", confidence=NO_ANSWER_CONF)
     value = str(raw["value"]).strip()
     note = str(raw.get("note") or "")
     conf = min(1.0, max(0.0, float(raw.get("confidence") or 0.5)))
-    vocab = VOCAB.get(field)
     if vocab:
         v = value.lower().replace(" ", "_").replace("-", "_")
         if v not in vocab:  # out of vocabulary: keep the model's word, never fall back to a default
@@ -210,6 +235,7 @@ def describe_slot(s: Session, slot: ir.Slot, ev: ir.Evidence) -> SlotMeaning:
     m.fields = {k: normalise(k, raw.get(k)) for k in VOCAB}
     m.style = {k: v for k, v in (raw.get("style") or {}).items() if k in STYLE_KEYS and v not in (None, "")}
     m.texts = [t for t in raw.get("texts") or [] if isinstance(t, dict) and t.get("id")]
+    m.layers = [x for x in raw.get("layers") or [] if isinstance(x, dict)]
     cache.write_text(m.model_dump_json(), encoding="utf-8")
     return m
 
@@ -230,3 +256,31 @@ def describe_reel(s: Session, slots: list[ir.Slot]) -> dict:
         return {"error": str(e)[:300]}
     cache.write_text(json.dumps(r), encoding="utf-8")
     return r
+
+
+def describe_transition(s: Session, t: ir.Transition, n_frames: int) -> TransitionMeaning:
+    """The measured window plus a second each side; the model names it, evidence keeps the window."""
+    cache = _cache_path(s.key, "transition", t.start, t.end, t.type.value, s.provider)
+    if cache.exists():
+        return TransitionMeaning.model_validate_json(cache.read_text(encoding="utf-8"))
+    lo, hi = max(0, t.start - TRANS_PAD), min(n_frames, t.end + TRANS_PAD)
+    base = lo if s.provider == "gemini" else 0  # gemini sees the window cut out; pegasus the whole reel
+    window = "" if s.provider == "gemini" else f" from {ir.f2s(lo):.2f} s to {ir.f2s(hi):.2f} s"
+    m = TransitionMeaning(after_slot=t.after_slot, start=t.start, end=t.end, provider=s.provider,
+                          answer=normalise("transition", None, TRANS_VOCAB))
+    try:
+        raw = s.ask(TRANS_PROMPT.format(window=window, a=ir.f2s(t.start - base), b=ir.f2s(t.end - base),
+                                        kind=t.type.value), TRANS_SCHEMA, lo, hi)
+    except Exception as e:  # not cached, so a rerun retries
+        m.error = str(e)[:300]
+        return m
+    m.answer = normalise("transition", raw, TRANS_VOCAB)
+    cache.write_text(m.model_dump_json(), encoding="utf-8")
+    return m
+
+
+def describe_transitions(s: Session, trans: list[ir.Transition], n_frames: int) -> list[TransitionMeaning]:
+    """Gradual transitions only: a hard cut has nothing to name."""
+    gradual = [t for t in trans if t.end > t.start]
+    with ThreadPoolExecutor(WORKERS) as pool:
+        return list(pool.map(lambda t: describe_transition(s, t, n_frames), gradual))

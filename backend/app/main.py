@@ -147,7 +147,7 @@ def _template_report(p: dict) -> dict | None:
             obj = obj[int(part)] if part.isdigit() else obj[part]
         return obj
 
-    losses = [x["loss"] for x in t["transitions"] + t["effects"] if x.get("loss")]
+    losses = [x["loss"] for x in t["transitions"] + t["effects"] + t.get("layers", []) if x.get("loss")]
     confirm = []
     for path in t.get("low_conf", []):
         try:

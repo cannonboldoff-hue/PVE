@@ -43,6 +43,7 @@ TextRole = Literal["hook_line", "title", "list_item", "label", "punchline", "cta
 ShotSize = Literal["extreme_close", "close", "medium", "wide", "extreme_wide", "none"]
 Binding = Literal["keep", "swap", "drop"]
 Media = Literal["video", "photo", "other"]
+LayerKind = Literal["shape_mask", "cutout", "moving_layer", "other"]
 
 
 class F(BaseModel, Generic[T]):
@@ -208,6 +209,18 @@ class Overlay(BaseModel):
     binding: Binding = "swap"
 
 
+class Layer(BaseModel):
+    """A mask, cutout or moving layer the video AI reported. No measurement behind it: low confidence."""
+    id: str
+    kind: F[LayerKind]
+    start: int
+    end: int
+    keys: list[Key]  # first and last box; two keys when it moves
+    shape: str = ""  # circle, heart, person outline ...
+    render: str = ""
+    loss: str = ""
+
+
 class Template(BaseModel):
     v: int
     key: str
@@ -218,6 +231,7 @@ class Template(BaseModel):
     effects: list[Effect] = Field(default_factory=list)
     texts: list[TextEvent] = Field(default_factory=list)
     overlays: list[Overlay] = Field(default_factory=list)
+    layers: list[Layer] = Field(default_factory=list)
     narrative: dict = Field(default_factory=dict)  # hook, arc, payoff, cta as free text
     unsupported: list[str] = Field(default_factory=list)  # evidence ids nothing could represent
     low_conf: list[str] = Field(default_factory=list)  # field paths that need a user confirm

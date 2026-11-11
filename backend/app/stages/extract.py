@@ -35,6 +35,7 @@ def build(obs: Observed, audio: str = "") -> Template:
                     transitions=[t.model_copy(deep=True) for t in obs.transitions], texts=texts,
                     effects=[e.model_copy(deep=True) for e in obs.effects],
                     overlays=[o.model_copy(deep=True) for o in obs.overlays],
+                    layers=[x.model_copy(deep=True) for x in obs.layers],
                     narrative=dict(obs.narrative), low_conf=low)
 
 
