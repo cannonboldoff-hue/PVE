@@ -97,7 +97,7 @@ async def run_brief(pid: str, key: str, analysis: dict) -> None:
 async def run_shots(pid: str) -> None:
     p = state.get(pid)
     template = brief_mod.get_template(p["reference_id"], _ref(p))
-    shots = await brief_mod.fill_shots(template, p["brief"])
+    shots = await brief_mod.fill_shots(template, p["brief"], brief_mod.load_ir(p["reference_id"]))
     db.update("projects", pid, shots=[s.model_dump() for s in shots], matches=[])
     msgs.text(p["conv_id"], f"Shot list ready: {len(shots)} shots. Edit or drop any shot, then I'll look through your clips.")
     msgs.card(p["conv_id"], "shots", pid)

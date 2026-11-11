@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .. import config, db
 from ..models import Plan
-from ..render import assemble, shot
+from ..render import assemble, shot, transition
 from . import editor
 from .graph import Node, compile_plan, order
 
@@ -47,6 +47,10 @@ def run(pid: str, plan: Plan, workdir: Path, on_progress: Callable[[], None]) ->
                     exact = plan.n_frames is not None
                     if n.kind == "prep":
                         (shot.prep if n.params.get("frames") is not None else editor.prep_clip)(n.params, out)
+                    elif n.kind == "trans":
+                        p = n.params
+                        transition.render(outputs[n.deps[0]], p["a_frames"], outputs[n.deps[1]], p["frames"],
+                                          p["xfade"], out)
                     else:
                         join = assemble.assemble if exact else editor.assemble
                         durations["total"] = join(plan, [outputs[d] for d in n.deps], workdir, out)

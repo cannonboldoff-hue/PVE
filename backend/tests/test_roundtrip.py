@@ -35,7 +35,7 @@ def test_cut_only_template_matches_truth_and_same_shot_pass(reel):
     assert {"frame count", "per-frame SSIM min", "lag (samples @8 kHz)"} <= metrics
     assert ir.load(key, "delta", ir.Delta).passed
     # evidence is cached by fingerprint + track version
-    assert [i.id for i in evidence.run_all(key).track("cuts")] == [i.id for i in ir.load(key, "evidence", ir.Evidence).items]
+    assert [i.id for i in evidence.run_all(key).track("cuts")] == [i.id for i in ir.load(key, "evidence", ir.Evidence).track("cuts")]
 
 
 def test_same_shot_pass_catches_a_short_slot(reel):

@@ -105,10 +105,20 @@ def get_template(key: str, analysis: dict) -> list[ShotSpec]:
     return [ShotSpec.model_validate(s) for s in t["shots"]]
 
 
-async def fill_shots(template: list[ShotSpec], brief: dict) -> list[ShotSpec]:
-    """Apply the brief to the template: the LLM rewrites content only; structure is copied from the template."""
+def _too_long(texts: list, limits: dict[str, int]) -> list[str]:
+    return [f"{t.id} has {len(t.text)} characters, max {limits[t.id]}" for t in texts
+            if t.id in limits and len(t.text) > limits[t.id]]
+
+
+async def fill_shots(template: list[ShotSpec], brief: dict, ir_template=None) -> list[ShotSpec]:
+    """Apply the brief to the template: the LLM rewrites content only; structure is copied from the template.
+    IR templates also send each measured text event ({id, role, original, max_chars}) and get its new words back."""
+    from . import extract
+
     slots = [{"slot": s.shot_id, "seconds": round(s.duration, 2), "purpose": s.purpose, "subject": s.subject,
               "action": s.action, "camera": s.camera, "camera_motion": s.camera_motion, "text": s.text} for s in template]
+    per_slot = extract.slot_texts(ir_template) if ir_template else []
+    events = [{**e, "slot": k + 1} for k, per in enumerate(per_slot) for e in per]
     msg = (
         f"Template slots (the reference's structure):\n{json.dumps(slots)}\n\nBrief:\n{json.dumps(brief)}\n\n"
         "Return `shots`: exactly one entry per slot, same order. Rewrite the content for the new Reel's topic: purpose, "
@@ -117,10 +127,29 @@ async def fill_shots(template: list[ShotSpec], brief: dict) -> list[ShotSpec]:
         "has none or captions are off). Keep each slot's role and timing in mind. Describe subject and action concretely "
         "so they can be searched for in the user's own footage."
     )
-    out = await openrouter.chat_json([{"role": "system", "content": SYS}, {"role": "user", "content": msg}], ShotContentList)
+    if events:
+        msg += ("\n\nOn-screen text events of the reference (role, original words, max_chars):\n"
+                f"{json.dumps(events)}\nReturn `texts`: one {{id, text}} per event with new words for the new Reel, in "
+                "the brief's caption language, doing the same job as the original (a hook stays a hook, a list item "
+                "stays a list item, keep line breaks as \\n where the original has them). Never exceed max_chars.")
+    limits = {e["id"]: e["max_chars"] for e in events}
+    msgs_ = [{"role": "system", "content": SYS}, {"role": "user", "content": msg}]
+    out = await openrouter.chat_json(msgs_, ShotContentList)
+    if events and (bad := _too_long(out.texts, limits)):  # one retry with the reason
+        msgs_ += [{"role": "assistant", "content": out.model_dump_json()},
+                  {"role": "user", "content": "These texts are too long: " + "; ".join(bad) + ". Shorten them."}]
+        out = await openrouter.chat_json(msgs_, ShotContentList)
     if len(out.shots) != len(template):
         raise ValueError(f"expected {len(template)} shots for the template, got {len(out.shots)}")
-    return [t.model_copy(update=c.model_dump()) for t, c in zip(template, out.shots)]
+    new = {t.id: t.text[: limits[t.id]] if t.id in limits else t.text for t in out.texts}  # still long: cut
+    filled = []
+    for t, c in zip(template, out.shots):
+        s = t.model_copy(update=c.model_dump())
+        if t.texts:
+            s.texts = [{"id": x["id"], "text": new.get(x["id"], c.text or x["text"])} for x in t.texts]
+            s.text = " / ".join(x["text"].replace("\n", " ") for x in s.texts)
+        filled.append(s)
+    return filled
 
 
 def retime(shots: list[ShotSpec]) -> list[ShotSpec]:

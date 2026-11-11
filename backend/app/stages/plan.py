@@ -38,10 +38,26 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
         if template:
             ps.frames, orphan = slot_frames[s.shot_id] + orphan, 0
             ps.transition = "cut"  # M2: transitions are rebuilt from the template (M6), not from ShotSpec
-        if s.layout == "collage":
+            ps.caption = ""  # on-screen text comes from the template's measured text events (plan.texts)
+            slot = template.slots[s.shot_id - 1]
+            if slot.speed != [(0.0, 1.0)] or slot.freeze or slot.reverse:  # speed ramp, freeze, reverse
+                ps.speed_curve, ps.freeze, ps.reverse = list(slot.speed), list(slot.freeze), slot.reverse
+            if slot.camera.value != "static":  # the reference's camera move, redone on the new clip
+                ps.camera_path = [k.model_dump(mode="json") for k in slot.camera_path]
+                ps.shake = slot.shake
+        lay = template.slots[s.shot_id - 1].layout if template else None
+        boxes = template.slots[s.shot_id - 1].layout_boxes if template else []
+        if lay is not None and lay.value in ("split_v", "split_h", "pip", "collage", "letterbox", "blur_fill") and boxes:
+            ps.layout_boxes = [b.model_dump() for b in boxes]  # the reference's own boxes, one clip each
+            ps.tiles = [assets[a]["path"] for a in m.extra_assets if a in assets][: len(boxes) - 1]
+            ps.fit = "blur_fit" if lay.value == "blur_fill" else ps.fit
+
+        elif s.layout == "collage":
             tiles = [assets[a]["path"] for a in m.extra_assets if a in assets][: s.collage.tiles - 1]
             if tiles:  # one tile alone is just a single shot
                 ps.collage, ps.tiles = s.collage, tiles
+        if template and template.slots[s.shot_id - 1].colour:
+            ps.colour = template.slots[s.shot_id - 1].colour.model_dump()
         _fit_caption(ps)
         _custom_caption_timing(ps, s)
         out.append(ps)
@@ -49,7 +65,51 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
     if template and out:
         plan.n_frames = template.n_frames
         assert sum(p.frames for p in out) == template.n_frames, "slot frames must add up to the reference length"
+        plan.texts = plan_texts(template, shots) if captions else []
+        plan.effects = [e.model_dump(mode="json") for e in template.effects if e.render]
+        apply_transitions(plan, template)
     return plan
+
+
+def apply_transitions(plan: Plan, template) -> None:
+    """The template's transition windows between kept, adjacent slots. A window [a, b) around boundary c makes the
+    left clip run on to b and the right clip start at a; both share those b - a frames (tail / lead), so
+    sum(frames) - sum(window lengths) stays n_frames."""
+    plan.transitions = []
+    by_slot = {t.after_slot: t for t in template.transitions}
+    for i, (p, q) in enumerate(zip(plan.shots, plan.shots[1:])):
+        if q.shot_id != p.shot_id + 1:  # a skipped slot sits between: its frames went to p, keep a hard cut
+            continue
+        t = by_slot.get(template.slots[p.shot_id - 1].id)
+        if not t or t.end <= t.start or not t.render:
+            continue
+        c = template.slots[q.shot_id - 1].start
+        pre, post, n = c - t.start, t.end - c, t.end - t.start
+        if p.frames + post - p.lead - n < 0 or q.frames + pre - n < 0:  # window wider than a shot: hard cut
+            continue
+        p.frames, p.tail = p.frames + post, n
+        q.frames, q.lead = q.frames + pre, n
+        q.src_in = max(0.0, q.src_in - pre / 30)
+        plan.transitions.append({"after": i, "start": t.start, "end": t.end, "frames": n, "type": t.type.value,
+                                 "render": t.render, "loss": t.loss})
+
+
+def plan_texts(template, shots: list[dict]) -> list[dict]:
+    """Template text events with the new words from the filled shots. A slot whose only event was edited through
+    the shot card's single text field takes that edit."""
+    words = {}
+    for raw in shots:
+        s = ShotSpec(**raw)
+        evs = s.texts
+        if len(evs) == 1 and s.text.strip() and s.text.strip() != evs[0]["text"].replace("\n", " ").strip():
+            evs = [{**evs[0], "text": s.text.strip()}]
+        words |= {x["id"]: x["text"] for x in evs}
+    out = []
+    for e in template.texts:
+        d = e.model_dump(mode="json")
+        d["text"]["value"] = words.get(e.id, e.text.value)
+        out.append(d)
+    return out
 
 
 def _fit_caption(ps: PlanShot) -> None:
@@ -66,6 +126,8 @@ def _custom_caption_timing(ps: PlanShot, s: ShotSpec) -> None:
 
 
 def total_duration(plan: Plan) -> float:
+    if plan.n_frames is not None:  # clips overlap inside transition windows
+        return plan.n_frames / 30
     return sum(s.duration for s in plan.shots)
 
 

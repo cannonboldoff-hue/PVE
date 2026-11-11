@@ -135,12 +135,14 @@ class Slot(BaseModel):
     layout: F[Layout] = Field(default_factory=lambda: F[Layout](value="single"))
     layout_boxes: list[Box] = Field(default_factory=list)
     camera: F[CameraMove] = Field(default_factory=lambda: F[CameraMove](value="static"))
-    camera_path: list[Key] = Field(default_factory=list)  # zoom / pan / shake as keyframes
+    camera_path: list[Key] = Field(default_factory=list)  # zoom / pan as keyframes of the view region
+    shake: dict | None = None  # {amp: residual std as share of width, hz}
     speed: list[tuple[float, float]] = Field(default_factory=lambda: [(0.0, 1.0)])  # (position 0..1, factor)
     reverse: bool = False
     freeze: list[tuple[int, int]] = Field(default_factory=list)  # frame ranges inside the slot that hold one frame
     colour: ColourTarget | None = None
     requirement: Requirement | None = None  # filled by requirements.py
+    evidence: list[str] = Field(default_factory=list)  # measurement items consumed (speed, colour, geometry)
 
     @property
     def frames(self) -> int:

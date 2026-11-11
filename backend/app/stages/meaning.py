@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from .. import config, ir
 from ..clients import ff
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2  # 2: text event roles and font class
 WORKERS = 4
 NO_ANSWER_CONF = 0.0
 
@@ -45,10 +45,17 @@ def _answer_schema(vocab) -> dict:
 
 
 # no "enum": not every provider accepts it in a response schema; the vocabulary is in the descriptions and prompt
+TEXT_ROLES = get_args(ir.TextRole)
+FONT_CLASSES = ("sans", "serif", "script", "display", "mono")
 SLOT_SCHEMA = {
     "type": "object",
     "properties": {**{k: _answer_schema(v) for k, v in VOCAB.items()},
-                   "style": {"type": "object", "properties": {k: {"type": "string"} for k in STYLE_KEYS}}},
+                   "style": {"type": "object", "properties": {k: {"type": "string"} for k in STYLE_KEYS}},
+                   "texts": {"type": "array", "items": {"type": "object", "properties": {
+                       "id": {"type": "string"},
+                       "role": {"type": "string", "description": "one of: " + ", ".join(TEXT_ROLES)},
+                       "font_class": {"type": "string", "description": "one of: " + ", ".join(FONT_CLASSES)},
+                       "anim_note": {"type": "string"}}}}},
     "required": list(VOCAB),
 }
 REEL_SCHEMA = {
@@ -68,7 +75,10 @@ SLOT_PROMPT = (
     + "\nrole is why this shot is in the story (hook, establish, detail, action, reveal, reaction, payoff, cta); "
       "function is one line on what the shot does for the viewer. Also fill `style` with the on-screen text (exact "
       "words), background, frame_motion, overlays, caption look (font, colour, position, size, emphasis, how it "
-      "animates in), color_look and, for a collage, tiles / background / style.")
+      "animates in), color_look and, for a collage, tiles / background / style. For each measured text event listed "
+      "in the facts, return `texts` with its id, its role (" + ", ".join(TEXT_ROLES) + "), the font_class of its "
+      "lettering (" + ", ".join(FONT_CLASSES) + ") and anim_note: how it appears (pop, slide, typewriter, word "
+      "highlight, fade...).")
 REEL_PROMPT = (
     "This is a vertical short-form video cut into {n} shots at these times (seconds): {cuts}. Describe its story: the "
     "hook, the arc, the payoff and the call to action, its overall style, and how shots relate to each other "
@@ -88,6 +98,7 @@ class SlotMeaning(BaseModel):
     provider: str
     fields: dict[str, Answer] = Field(default_factory=dict)
     style: dict = Field(default_factory=dict)
+    texts: list[dict] = Field(default_factory=list)  # [{id, role, font_class, anim_note}] for measured text events
     error: str = ""
 
 
@@ -162,6 +173,9 @@ def _facts(slot: ir.Slot, ev: ir.Evidence) -> str:
     for i in ev.items:
         if i.track != "cuts" and i.start < slot.end and i.end > slot.start and "value" in i.data:
             facts.append(f"{i.track}: {i.data['value']}")
+        if i.track == "text" and slot.start <= i.start < slot.end:
+            facts.append(f"text event {i.id}: {json.dumps(i.data['text'])} from {ir.f2s(i.start - slot.start):.2f} s "
+                         f"to {ir.f2s(i.end - slot.start):.2f} s of this shot")
     return "; ".join(facts)
 
 
@@ -179,6 +193,7 @@ def describe_slot(s: Session, slot: ir.Slot, ev: ir.Evidence) -> SlotMeaning:
         return m
     m.fields = {k: normalise(k, raw.get(k)) for k in VOCAB}
     m.style = {k: v for k, v in (raw.get("style") or {}).items() if k in STYLE_KEYS and v not in (None, "")}
+    m.texts = [t for t in raw.get("texts") or [] if isinstance(t, dict) and t.get("id")]
     cache.write_text(m.model_dump_json(), encoding="utf-8")
     return m
 

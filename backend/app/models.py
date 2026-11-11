@@ -86,6 +86,7 @@ class ShotSpec(BaseModel):
     layout: Literal["single", "collage"] = "single"
     collage: Collage = Field(default_factory=Collage)
     skipped: bool = False
+    texts: list[dict] = Field(default_factory=list)  # IR templates: [{id, text}] per measured text event in this slot
 
     @property
     def duration(self) -> float:
@@ -106,8 +107,14 @@ class ShotContent(BaseModel):
     text: str = ""
 
 
+class TextFill(BaseModel):
+    id: str
+    text: str
+
+
 class ShotContentList(BaseModel):
     shots: list[ShotContent]
+    texts: list[TextFill] = Field(default_factory=list, description="one entry per measured text event, by id")
 
 
 class Match(BaseModel):
@@ -146,7 +153,8 @@ class PlanShot(BaseModel):
     speed_curve: list[tuple[float, float]] | None = None
     reverse: bool = False
     freeze: list[tuple[int, int]] = Field(default_factory=list)
-    camera_path: list[dict] = Field(default_factory=list)  # ir.Key dicts
+    camera_path: list[dict] = Field(default_factory=list)  # ir.Key dicts, frames relative to the slot start
+    shake: dict | None = None  # {amp, hz}
     layout_boxes: list[dict] = Field(default_factory=list)
     colour: dict | None = None
 

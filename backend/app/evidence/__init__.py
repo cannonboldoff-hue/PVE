@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from .. import ir
 
-TRACK_MODULES = ["cuts"]  # grows per milestone
+TRACK_MODULES = ["cuts", "transitions", "text", "text_anim", "camera", "speed", "effects", "layout", "overlays", "colour"]  # grows per milestone
 EVIDENCE_VERSION = 1
 
 
@@ -24,6 +24,13 @@ class Ctx:
         from ..stages.analyze import proxy_path
 
         return proxy_path(self.key)
+
+
+def boundaries(ev: dict) -> list[tuple[int, int, int]]:
+    """(boundary frame, window start, window end) per shot change: the transitions track when it ran, else cuts."""
+    if "transitions" in ev:
+        return [(i.data["frame"], i.start, i.end) for i in sorted(ev["transitions"], key=lambda i: i.data["frame"])]
+    return [(i.data["frame"],) * 3 for i in sorted(ev.get("cuts", []), key=lambda i: i.data["frame"])]
 
 
 def tracks() -> dict:
@@ -56,8 +63,8 @@ def run_all(key: str, only: list[str] | None = None) -> ir.Evidence:
         raise FileNotFoundError(f"no ingested source for {key}")
     mods = tracks()
     want = set(only or mods)
-    for name in list(want):  # pull in dependencies
-        want |= set(mods[name].DEPS)
+    while (more := {d for name in want for d in mods[name].DEPS} - want):  # pull in dependencies, transitively
+        want |= more
     ctx = Ctx(key, src)
 
     def one(mod) -> None:

@@ -36,3 +36,22 @@ def load(key: str) -> tuple[np.ndarray, np.ndarray]:
             np.save(c, rgb)
             np.save(g, gray)
     return np.load(g, mmap_mode="r"), np.load(c, mmap_mode="r")
+
+
+MID_W = 320  # gray stack for feature tracking: corners and sub-pixel flow need more than SMALL_W
+
+
+def load_mid(key: str) -> np.ndarray:
+    """Gray (n, h, w) uint8 at MID_W wide, memory-mapped."""
+    from ..stages.analyze import proxy_path
+
+    with _guard:
+        lock = _locks.setdefault(key + ":mid", threading.Lock())
+    p = ir.ref_dir(key) / "frames" / "gray_mid.npy"
+    with lock:
+        if not p.exists():
+            p.parent.mkdir(exist_ok=True)
+            src = ir.load(key, "source", ir.Source)
+            h = int(round(MID_W * src.height / src.width / 2)) * 2
+            np.save(p, ff.decode(proxy_path(key), MID_W, h, gray=True))
+    return np.load(p, mmap_mode="r")
