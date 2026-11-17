@@ -8,3 +8,6 @@ gold/**/*.mp4
 gold/**/*.mov
 .pytest_cache/
 overlay/**/node_modules/
+filmcraft/
+effectcraft/
+tools-bin/

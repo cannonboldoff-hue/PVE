@@ -69,8 +69,11 @@ def ssim(a: str | Path, b: str | Path) -> list[float]:
     """Per-frame SSIM (All) of a against b. Both must have the same size and frame count to be meaningful."""
     with tempfile.TemporaryDirectory() as d:
         # stats_file path goes through the filter parser: run in that dir and use a bare name to avoid escaping C:\
+        # pair frames by index: concat renders carry sub-ms pts drift that makes timestamp sync pair frame k with k-1
+        idx = "settb=1/1000,setpts=N*1000/30"
         p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(Path(a).resolve()),
-                            "-i", str(Path(b).resolve()), "-lavfi", "[0:v][1:v]ssim=stats_file=s.log", "-f", "null", "-"],
+                            "-i", str(Path(b).resolve()), "-lavfi",
+                            f"[0:v]{idx}[a];[1:v]{idx}[b];[a][b]ssim=stats_file=s.log", "-f", "null", "-"],
                            cwd=d, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if p.returncode:
             raise RuntimeError(f"ssim failed: {p.stderr.strip()[-400:]}")

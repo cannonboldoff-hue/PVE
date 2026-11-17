@@ -10,7 +10,7 @@ import numpy as np
 from .. import ir
 from .frames import load_mid
 
-NAME, VERSION, DEPS = "camera", 3, ["cuts", "transitions", "text"]
+NAME, VERSION, DEPS = "camera", 4, ["cuts", "transitions", "text"]
 MAX_CORNERS = 300
 MIN_INLIERS = 25  # RANSAC inliers needed before a transform is believed
 MIN_POINTS = 40  # fewer tracked points than this: detect new ones (anchored back to the first frame)
@@ -20,6 +20,11 @@ PAN_MIN = 0.04  # view-centre travel (share of the frame) that counts as a pan o
 SHAKE_MIN = 0.003  # residual std (share of frame width) that counts as handheld or shake
 SHAKE_HZ = 3.0  # residual sign changes per second / 2 at or above this: shake, below: handheld
 KEY_EVERY = 5  # keyframe spacing of the stored smooth path
+SHAKE_WIN = 9  # frames in the sliding window that finds where it shakes
+SHAKE_MIN_FRAMES = 4  # a shake window shorter than this is noise
+WHOLE_SHAKE = 0.8  # windows covering this share of the slot: it shakes throughout (the slot summary says so)
+PUNCH_MIN = 0.04  # |log scale| above the slot's slow zoom that counts as a punch
+PUNCH_MAX = 10  # a punch goes out and comes back within this many frames
 STILL_DIFF = 40  # gray difference after removing the camera that counts as motion
 STILL_BLOB = 20  # moving pixels (after a 3x3 opening) in a frame that make it "moving"
 STILL_SHARE = 0.3  # share of checked frames that must move for the slot to be video
@@ -51,10 +56,11 @@ def track(gray: np.ndarray, mask: np.ndarray) -> list[np.ndarray]:
     origin, cur = p0.reshape(-1, 2), p0.reshape(-1, 2)
     A = eye
     for k in range(1, len(gray)):
-        nxt, st, _ = cv2.calcOpticalFlowPyrLK(gray[k - 1], gray[k], cur.reshape(-1, 1, 2).astype(np.float32), None,
-                                              winSize=(21, 21), maxLevel=3)
-        ok = st.ravel() == 1
-        origin, cur = origin[ok], nxt.reshape(-1, 2)[ok]
+        if len(cur):  # LK returns None for an empty point set (every track lost on a hard cut or blank frame)
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(gray[k - 1], gray[k], cur.reshape(-1, 1, 2).astype(np.float32), None,
+                                                  winSize=(21, 21), maxLevel=3)
+            ok = st.ravel() == 1
+            origin, cur = origin[ok], nxt.reshape(-1, 2)[ok]
         if len(cur) >= 6:
             M, inl = cv2.estimateAffinePartial2D(origin, cur, method=cv2.RANSAC, ransacReprojThreshold=1.5)
             if M is not None and inl is not None and inl.sum() >= MIN_INLIERS and inl.mean() >= 0.5:
@@ -107,6 +113,67 @@ def classify(path: np.ndarray, fps: int = ir.FPS) -> tuple[str, dict]:
     return "static", info
 
 
+def _runs(flags: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    out, k = [], 0
+    while k < len(flags):
+        if flags[k]:
+            j = k
+            while j < len(flags) and flags[j]:
+                j += 1
+            if j - k >= min_len:
+                out.append((k, j))
+            k = j
+        k += 1
+    return out
+
+
+def shake_windows(path: np.ndarray, fps: int = ir.FPS) -> list[list[float]]:
+    """[start, end, amp, hz] (frames relative to the path) where the residual around the smooth path is shake.
+    Empty when there is none, or when it shakes through the whole slot (the slot summary covers that)."""
+    n = len(path)
+    if n < SHAKE_WIN + 2:
+        return []
+    sm = np.stack([_smooth(path[:, i]) for i in (1, 2)], 1)
+    res = path[:, 1:3] - sm
+    half = SHAKE_WIN // 2
+    local = np.array([res[max(0, k - half):k + half + 1].std(axis=0).max() for k in range(n)])
+    out = []
+    for a, b in _runs(local > SHAKE_MIN, SHAKE_MIN_FRAMES):
+        r = res[a:b, 0] - res[a:b, 0].mean()
+        flips = np.abs(np.diff(np.sign(r))).sum() / 2
+        out.append([a, b, round(float(local[a:b].max()), 5), round(float(flips / 2 / max(1e-6, (b - a) / fps)), 2)])
+    if sum(b - a for a, b, _, _ in out) >= WHOLE_SHAKE * n:
+        return []
+    return out
+
+
+def punches(path: np.ndarray) -> list[list[float]]:
+    """[start, peak, end, scale ratio] for fast zooms that go out and come back (zoom punch), relative frames."""
+    n = len(path)
+    if n < 5:
+        return []
+    ls = np.log(np.maximum(path[:, 0], 1e-6))
+    k = min(31, n // 2 * 2 - 1)  # the slot's slow zoom, which the punch rides on
+    base = np.convolve(np.pad(ls, k // 2, mode="edge"), np.ones(k) / k, mode="valid") if k >= 3 else ls
+    dev = ls - base
+    out = []
+    for a, b in _runs(np.abs(dev) > PUNCH_MIN, 2):
+        if b - a > PUNCH_MAX:
+            continue
+        p = a + int(np.argmax(np.abs(dev[a:b])))
+        out.append([max(0, a - 1), p, min(n - 1, b), round(float(math.exp(dev[p])), 4)])
+    return out
+
+
+def keyframes(path: np.ndarray, hits: list[list[float]]) -> list[list[float]]:
+    """Smooth path every KEY_EVERY frames; inside a punch every frame of the raw path, so the peak survives."""
+    n = len(path)
+    sm = np.stack([_smooth(path[:, i]) for i in range(4)], 1)
+    raw = {f for a, _, b, _ in hits for f in range(int(a), int(b) + 1)}
+    frames = sorted({*range(0, n, KEY_EVERY), n - 1} | raw)
+    return [[f, *map(float, path[f] if f in raw else sm[f])] for f in frames]
+
+
 def still(gray: np.ndarray, As: list[np.ndarray], mask: np.ndarray) -> tuple[bool, float]:
     """(is a photo, share of checked frames with motion left after removing the camera)."""
     h, w = gray.shape[1:]
@@ -141,10 +208,12 @@ def run(ctx) -> list[ir.Item]:
         As = track(g, mask) if len(g) > 2 else [np.array([[1.0, 0, 0], [0, 1.0, 0]])] * len(g)
         path = np.array([view(A, w, h) for A in As])
         move, info = classify(path) if len(g) > 2 else ("static", {})
-        sm = np.stack([_smooth(path[:, i]) for i in range(4)], 1)
-        keys = [[f, *map(float, sm[f])] for f in sorted({*range(0, len(g), KEY_EVERY), len(g) - 1})]
+        hits = punches(path)
+        keys = keyframes(path, hits)
         items.append(ir.Item(id=f"camera_{k}", track=NAME, start=a, end=b, conf=0.8 if move != "static" else 0.9,
-                             tool="opencv lk + ransac similarity", data={"value": move, "path": keys, **info}))
+                             tool="opencv lk + ransac similarity",
+                             data={"value": move, "path": keys, "shake_windows": shake_windows(path),
+                                   "punches": hits, **info}))
         photo, share = still(g, As, mask) if len(g) > 3 else (False, 1.0)
         items.append(ir.Item(id=f"still_{k}", track="still", start=a, end=b, conf=0.6 if photo else 0.8,
                              tool="camera-compensated difference",

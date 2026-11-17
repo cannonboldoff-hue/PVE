@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from . import config
 
@@ -36,11 +36,12 @@ CameraMove = Literal["static", "zoom_in", "zoom_out", "pan_left", "pan_right", "
                      "shake", "other"]
 TextAnim = Literal["none", "fade", "pop", "slide_up", "slide_down", "slide_left", "slide_right", "typewriter",
                    "word_highlight", "bounce", "other"]
-Layout = Literal["single", "blur_fill", "letterbox", "split_h", "split_v", "collage", "pip"]
+Layout = Literal["single", "blur_fill", "letterbox", "split_h", "split_v", "collage", "pip", "other"]
 OverlayKind = Literal["sticker", "emoji", "shape", "frame", "progress_bar", "logo", "other"]
 Role = Literal["hook", "establish", "detail", "action", "reveal", "reaction", "payoff", "cta", "other"]
 TextRole = Literal["hook_line", "title", "list_item", "label", "punchline", "cta", "caption", "other"]
-ShotSize = Literal["extreme_close", "close", "medium", "wide", "extreme_wide", "none"]
+# every closed vocabulary keeps "other": meaning.normalise maps out-of-vocabulary answers there
+ShotSize = Literal["extreme_close", "close", "medium", "wide", "extreme_wide", "none", "other"]
 Binding = Literal["keep", "swap", "drop"]
 Media = Literal["video", "photo", "other"]
 LayerKind = Literal["shape_mask", "cutout", "moving_layer", "other"]
@@ -54,6 +55,16 @@ class F(BaseModel, Generic[T]):
     source: str = ""  # "cuts", "ocr", "gemini", "fusion", "llm", "user"
     evidence: list[str] = Field(default_factory=list)  # ids of Evidence items
     binding: Binding | None = None  # set in extraction
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bare(cls, d: Any) -> Any:
+        """Accept the compact forms from compact(): a bare value, or {"v": ...}."""
+        if not isinstance(d, dict):
+            return {"value": d}
+        if "v" in d and "value" not in d:
+            return {**{k: x for k, x in d.items() if k != "v"}, "value": d["v"]}
+        return d
 
 
 class Item(BaseModel):
@@ -97,6 +108,15 @@ class Key(BaseModel):  # one keyframe of a moving thing
     rotation: float = 0.0
     opacity: float = 1.0
 
+    @model_validator(mode="before")
+    @classmethod
+    def _from_list(cls, d: Any) -> Any:
+        """Accept the compact form [frame, x, y, w, h, scale?, rotation?, opacity?]."""
+        if not isinstance(d, (list, tuple)):
+            return d
+        return dict(zip(("frame", "scale", "rotation", "opacity"), (d[0], *d[5:8])),
+                    box=dict(zip("xywh", d[1:5])))
+
 
 class ColourTarget(BaseModel):
     """Per-shot Lab statistics (text and overlays masked out)."""
@@ -110,8 +130,36 @@ class ColourTarget(BaseModel):
     contrast: float
 
 
+class ShakeWindow(BaseModel):
+    """A stretch of shake inside a slot; frames relative to the slot start, end exclusive."""
+    start: int
+    end: int
+    amp: float  # residual std as share of width
+    hz: float
+
+
+class Tile(BaseModel):
+    """One box of a multi-box slot (split, pip, collage), with its own measured motion. Box order = layout_boxes."""
+    box: int
+    speed: list[tuple[float, float]] = Field(default_factory=lambda: [(0.0, 1.0)])
+    freeze: list[tuple[int, int]] = Field(default_factory=list)
+    reverse: bool = False
+    camera: CameraMove = "static"
+    camera_path: list[Key] = Field(default_factory=list)
+    shake_windows: list[ShakeWindow] = Field(default_factory=list)
+    continues: bool = False  # no cut in this box at the slot's start: the previous slot's clip keeps playing
+    role: str = ""  # what the box shows ("main content", "satisfying loop"), from the video AI
+
+
+class Word(BaseModel):
+    """One word of a text event: when it first shows or lights up (absolute frame), and its colour then."""
+    i: int
+    start: int
+    fill: str | None = None
+
+
 class Requirement(BaseModel):
-    media: Literal["video", "photo", "any"] = "any"
+    media: Literal["video", "photo", "cutout", "any"] = "any"  # cutout: subject on alpha (WebM / MOV / PNG)
     orientation: Literal["portrait", "landscape", "any"] = "any"
     footage_frames: int = 0  # source frames the slot consumes, incl. lead and tail
     shot_size: ShotSize = "none"
@@ -120,6 +168,8 @@ class Requirement(BaseModel):
     movement: str = ""
     hard: dict = Field(default_factory=dict)
     soft: dict = Field(default_factory=dict)
+    instructions: list[str] = Field(default_factory=list)  # plain-language shot list lines for the user
+    tiles: list["Requirement"] = Field(default_factory=list)  # boxes 1..n of a multi-box slot
 
 
 class Slot(BaseModel):
@@ -137,7 +187,9 @@ class Slot(BaseModel):
     layout_boxes: list[Box] = Field(default_factory=list)
     camera: F[CameraMove] = Field(default_factory=lambda: F[CameraMove](value="static"))
     camera_path: list[Key] = Field(default_factory=list)  # zoom / pan as keyframes of the view region
-    shake: dict | None = None  # {amp: residual std as share of width, hz}
+    shake: dict | None = None  # {amp: residual std as share of width, hz}, over the whole slot
+    shake_windows: list[ShakeWindow] = Field(default_factory=list)  # where it shakes, when not the whole slot
+    tiles: list[Tile] = Field(default_factory=list)  # per box of a multi-box layout; empty for single
     speed: list[tuple[float, float]] = Field(default_factory=lambda: [(0.0, 1.0)])  # (position 0..1, factor)
     reverse: bool = False
     freeze: list[tuple[int, int]] = Field(default_factory=list)  # frame ranges inside the slot that hold one frame
@@ -190,13 +242,17 @@ class TextEvent(BaseModel):
     end: int
     text: F[str]  # binding "swap"; raw holds the reference's words
     role: F[TextRole] = Field(default_factory=lambda: F[TextRole](value="caption"))
-    keys: list[Key]  # box path; first key is the resting position
+    keys: list[Key] = Field(default_factory=list)  # box path; first key is the resting position
     style: TextStyle = Field(default_factory=TextStyle)
     anim_in: F[TextAnim] = Field(default_factory=lambda: F[TextAnim](value="none"))
     anim_out: F[TextAnim] = Field(default_factory=lambda: F[TextAnim](value="none"))
     anim_in_frames: int = 0
     anim_out_frames: int = 0
     max_chars: int = 0  # from box width and display time
+    words: list[Word] = Field(default_factory=list)  # per-word reveal / highlight timing, when measured
+    highlight: str | None = None  # colour a lit word turns
+    key_words: list[int] = Field(default_factory=list)  # indices of the new text's words to highlight (LLM pick)
+    perspective: dict | None = None  # {rx, ry} degrees of 3D tilt, from the video AI (OCR cannot measure it)
 
 
 class Overlay(BaseModel):
@@ -204,7 +260,7 @@ class Overlay(BaseModel):
     kind: F[OverlayKind]
     start: int
     end: int
-    keys: list[Key]
+    keys: list[Key] = Field(default_factory=list)
     description: F[str] = Field(default_factory=lambda: F[str](value=""))  # "red arrow sticker"
     binding: Binding = "swap"
 
@@ -215,8 +271,10 @@ class Layer(BaseModel):
     kind: F[LayerKind]
     start: int
     end: int
-    keys: list[Key]  # first and last box; two keys when it moves
+    keys: list[Key] = Field(default_factory=list)  # first and last box; two keys when it moves
     shape: str = ""  # circle, heart, person outline ...
+    above_text: bool = False  # drawn over the text layer (a cutout in front of the words)
+    bg: str | None = None  # shape mask: the flat colour around the shape
     render: str = ""
     loss: str = ""
 
@@ -225,7 +283,7 @@ class Template(BaseModel):
     v: int
     key: str
     n_frames: int
-    audio: str
+    audio: str = ""
     slots: list[Slot]
     transitions: list[Transition] = Field(default_factory=list)
     effects: list[Effect] = Field(default_factory=list)
@@ -254,6 +312,107 @@ class Delta(BaseModel):
     rows: list[DeltaRow] = Field(default_factory=list)
     coverage: float = 1.0  # share of evidence items used, dropped with a reason, or listed unsupported
     passed: bool = False
+
+
+# ---- compact form: what the VL model reads and writes (fewer tokens, no bookkeeping) ----
+# Lossy on purpose: provenance (source, evidence, conf >= 0.8), engine output (render, loss) and the
+# unsupported / low_conf / dropped logs are not the model's to emit; floats round to 4 places; keyframes
+# in the middle of a hold collapse. Defaults are omitted. expand() restores them through validation.
+
+_DERIVED = {"render", "loss", "unsupported", "low_conf", "dropped", "evidence"}
+_F_KEYS = set(F.model_fields)
+
+
+# tolerance per channel when a key is dropped: what linear interpolation of the neighbours may be off by
+_TOL = (0.002, 0.002, 0.002, 0.002, 0.01, 0.5, 0.02)  # x y w h scale rotation opacity
+_KEY_DEFAULT = (1.0, 0.0, 1.0)  # scale rotation opacity
+
+
+def _vec(k: dict) -> list[float]:
+    b = k["box"]
+    return [b["x"], b["y"], b["w"], b["h"], k.get("scale", 1.0), k.get("rotation", 0.0), k.get("opacity", 1.0)]
+
+
+def _off(ks: list[dict], i: int, j: int, m: int) -> float:
+    """How far key m is from the straight line between keys i and j, in tolerance units."""
+    span = ks[j]["frame"] - ks[i]["frame"]
+    t = (ks[m]["frame"] - ks[i]["frame"]) / span if span else 0.0
+    return max(abs(c - (a + (b - a) * t)) / tol for a, b, c, tol in zip(_vec(ks[i]), _vec(ks[j]), _vec(ks[m]), _TOL))
+
+
+def _simplify(ks: list[dict]) -> list[dict]:
+    """Douglas-Peucker over time: keep the first and last key, and any key a straight line would miss."""
+    ks = [k for n, k in enumerate(ks) if n == 0 or k != ks[n - 1]]
+    keep = {0, len(ks) - 1}
+    todo = [(0, len(ks) - 1)]
+    while todo:
+        i, j = todo.pop()
+        far = max(range(i + 1, j), key=lambda m: _off(ks, i, j, m), default=None)
+        if far is not None and _off(ks, i, j, far) > 1:
+            keep.add(far)
+            todo += [(i, far), (far, j)]
+    return [ks[n] for n in sorted(keep)]
+
+
+def _pack(k: dict) -> list:
+    """[frame, x, y, w, h] plus scale, rotation, opacity up to the last one that is not the default."""
+    v = _vec(k)
+    tail = v[4:]
+    while tail and tail[-1] == _KEY_DEFAULT[len(tail) - 1]:
+        tail.pop()
+    return [k["frame"], *v[:4], *tail]
+
+
+_FREE = {"params", "raw", "narrative", "hard", "soft", "shake", "perspective"}  # free-form dicts: never read as an F
+
+
+def _squeeze(o: Any, free: bool = False) -> Any:
+    if isinstance(o, float):
+        return round(o, 4)
+    if isinstance(o, list):
+        return [_squeeze(x, free) for x in o]
+    if not isinstance(o, dict):
+        return o
+    if not free and "value" in o and set(o) <= _F_KEYS:  # an F: keep the value, and what only a reader can't guess
+        v = _squeeze(o["value"])
+        f = {}
+        if o.get("raw") not in (None, o["value"]):
+            f["raw"] = _squeeze(o["raw"], True)
+        if o.get("conf", 1.0) < 0.8:
+            f["conf"] = round(o["conf"], 2)
+        if o.get("binding"):
+            f["binding"] = o["binding"]
+        return {"v": v, **f} if f else v
+    # shortcut: "outline" None means no outline (its default is black), so it is the one null that carries meaning
+    o = {k: v for k, x in o.items() if free or k not in _DERIVED
+         if (v := _squeeze(x, free or k in _FREE)) not in (None, [], {}) or k == "outline"}
+    for f in () if free else ("keys", "camera_path"):
+        if isinstance(o.get(f), list) and all(isinstance(k, dict) and "frame" in k for k in o[f]):
+            o[f] = [_pack(k) for k in _simplify(o[f])]
+    return o
+
+
+def compact(t: Template) -> dict:
+    d = _squeeze(t.model_dump(mode="json", exclude_defaults=True))
+    # the app that made an unknown effect is one constant per file: say it once at the top
+    raws = [e["type"]["raw"] for e in d.get("effects", [])
+            if isinstance(e["type"], dict) and isinstance(e["type"].get("raw"), dict)]
+    apps = {r.get("app") for r in raws}
+    if raws and len(apps) == 1 and None not in apps:
+        d["app"] = apps.pop()
+        for r in raws:
+            del r["app"]
+    return d
+
+
+def expand(d: dict) -> Template:
+    d = dict(d)
+    app = d.pop("app", None)
+    if app:
+        d["effects"] = [{**e, "type": {**e["type"], "raw": {"app": app, **e["type"]["raw"]}}}
+                        if isinstance(e["type"], dict) and isinstance(e["type"].get("raw"), dict) else e
+                        for e in d.get("effects", [])]
+    return Template.model_validate(d)
 
 
 # ---- storage: data/refs/<key>/ir/<layer>.json = {"v", "inputs", "data"} ----

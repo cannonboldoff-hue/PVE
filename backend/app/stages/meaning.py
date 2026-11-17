@@ -18,7 +18,8 @@ from ..clients import ff
 
 RETRIES = 3  # rate-limit retries per call
 BACKOFF = 5.0  # seconds, doubled each retry
-PROMPT_VERSION = 3  # 2: text event roles and font class; 3: masks, cutouts, moving layers
+PROMPT_VERSION = 4  # 2: text roles, font class; 3: masks, cutouts, moving layers; 4: reverse, effects, tiles,
+# match cut in, 3D text tilt
 TRANS_PAD = 30  # frames of context each side of a transition window (one second)
 WORKERS = 4
 NO_ANSWER_CONF = 0.0
@@ -61,11 +62,21 @@ SLOT_SCHEMA = {
                        "id": {"type": "string"},
                        "role": {"type": "string", "description": "one of: " + ", ".join(TEXT_ROLES)},
                        "font_class": {"type": "string", "description": "one of: " + ", ".join(FONT_CLASSES)},
-                       "anim_note": {"type": "string"}}}},
+                       "anim_note": {"type": "string"},
+                       "tilt_x": {"type": "number", "description": "3D tilt back/forward in degrees, 0 if flat"},
+                       "tilt_y": {"type": "number", "description": "3D turn left/right in degrees, 0 if flat"}}}},
                    "layers": {"type": "array", "items": {"type": "object", "properties": {
                        "kind": {"type": "string", "description": "one of: " + ", ".join(get_args(ir.LayerKind))},
                        "shape": {"type": "string"}, "box": BOX, "end_box": BOX, "note": {"type": "string"},
-                       "confidence": {"type": "number"}}}}},
+                       "in_front_of_text": {"type": "boolean"}, "confidence": {"type": "number"}}}},
+                   "reverse": _answer_schema(("yes", "no")),
+                   "match_cut_in": _answer_schema(("yes", "no")),
+                   "effects": {"type": "array", "items": {"type": "object", "properties": {
+                       "type": {"type": "string", "description": "one of: " + ", ".join(get_args(ir.EffectType))},
+                       "start_s": {"type": "number"}, "end_s": {"type": "number"}, "confidence": {"type": "number"}}}},
+                   "tiles": {"type": "array", "items": {"type": "object", "properties": {
+                       "box": {"type": "integer", "description": "0-based, in the order of the measured layout boxes"},
+                       "role": {"type": "string"}}}}},
     "required": list(VOCAB),
 }
 REEL_SCHEMA = {
@@ -88,7 +99,16 @@ SLOT_PROMPT = (
       "animates in), color_look and, for a collage, tiles / background / style. For each measured text event listed "
       "in the facts, return `texts` with its id, its role (" + ", ".join(TEXT_ROLES) + "), the font_class of its "
       "lettering (" + ", ".join(FONT_CLASSES) + ") and anim_note: how it appears (pop, slide, typewriter, word "
-      "highlight, fade...). If the footage is shown through a shape (shape_mask), a subject is cut out from its background (cutout), or a picture layer moves across the frame (moving_layer), list each in `layers` with its shape, box at the start of the shot, end_box at the end, a note and confidence; leave `layers` empty otherwise.")
+      "highlight, fade...), plus tilt_x / tilt_y when the lettering is tilted in 3D (0 when flat). If the footage is "
+      "shown through a shape (shape_mask), a subject is cut out from its background (cutout), or a picture layer "
+      "moves across the frame (moving_layer), list each in `layers` with its shape, box at the start of the shot, "
+      "end_box at the end, in_front_of_text (true when the cut-out subject covers on-screen words), a note and "
+      "confidence; leave `layers` empty otherwise. reverse: yes when the footage plays backwards. match_cut_in: yes "
+      "when this shot starts with a match cut (the subject or a shape stays in the same place and size while the "
+      "scene, outfit or location changes). effects: each visual effect with its type (" +
+    ", ".join(get_args(ir.EffectType)) + "), start_s / end_s in seconds from the start of this shot and confidence; "
+      "empty when there is none. tiles: for a split screen, picture in picture or collage, what each box shows "
+      "(box 0-based in the measured layout order, role e.g. 'main content', 'satisfying loop', 'reaction face').")
 REEL_PROMPT = (
     "This is a vertical short-form video cut into {n} shots at these times (seconds): {cuts}. Describe its story: the "
     "hook, the arc, the payoff and the call to action, its overall style, and how shots relate to each other "
@@ -118,6 +138,10 @@ class SlotMeaning(BaseModel):
     style: dict = Field(default_factory=dict)
     texts: list[dict] = Field(default_factory=list)  # [{id, role, font_class, anim_note}] for measured text events
     layers: list[dict] = Field(default_factory=list)  # [{kind, shape, box, end_box, note, confidence}]
+    reverse: Answer | None = None  # yes / no
+    match_cut_in: Answer | None = None  # yes / no: this shot starts with a match cut
+    effects: list[dict] = Field(default_factory=list)  # [{type, start_s, end_s, confidence}], seconds into the slot
+    tiles: list[dict] = Field(default_factory=list)  # [{box, role}]
     error: str = ""
 
 
@@ -236,6 +260,10 @@ def describe_slot(s: Session, slot: ir.Slot, ev: ir.Evidence) -> SlotMeaning:
     m.style = {k: v for k, v in (raw.get("style") or {}).items() if k in STYLE_KEYS and v not in (None, "")}
     m.texts = [t for t in raw.get("texts") or [] if isinstance(t, dict) and t.get("id")]
     m.layers = [x for x in raw.get("layers") or [] if isinstance(x, dict)]
+    m.reverse = normalise("reverse", raw.get("reverse"), ("yes", "no")) if raw.get("reverse") else None
+    m.match_cut_in = normalise("match_cut_in", raw.get("match_cut_in"), ("yes", "no")) if raw.get("match_cut_in") else None
+    m.effects = [x for x in raw.get("effects") or [] if isinstance(x, dict) and x.get("type")]
+    m.tiles = [x for x in raw.get("tiles") or [] if isinstance(x, dict) and isinstance(x.get("box"), int)]
     cache.write_text(m.model_dump_json(), encoding="utf-8")
     return m
 

@@ -131,7 +131,9 @@ async def fill_shots(template: list[ShotSpec], brief: dict, ir_template=None) ->
         msg += ("\n\nOn-screen text events of the reference (role, original words, max_chars):\n"
                 f"{json.dumps(events)}\nReturn `texts`: one {{id, text}} per event with new words for the new Reel, in "
                 "the brief's caption language, doing the same job as the original (a hook stays a hook, a list item "
-                "stays a list item, keep line breaks as \\n where the original has them). Never exceed max_chars.")
+                "stays a list item, keep line breaks as \\n where the original has them). Never exceed max_chars. "
+                "Where an event has highlighted_words (0-based word indices the reference shows in a highlight "
+                "colour), also return key_words: the indices of the matching key words in your new text.")
     limits = {e["id"]: e["max_chars"] for e in events}
     msgs_ = [{"role": "system", "content": SYS}, {"role": "user", "content": msg}]
     out = await openrouter.chat_json(msgs_, ShotContentList)
@@ -142,11 +144,15 @@ async def fill_shots(template: list[ShotSpec], brief: dict, ir_template=None) ->
     if len(out.shots) != len(template):
         raise ValueError(f"expected {len(template)} shots for the template, got {len(out.shots)}")
     new = {t.id: t.text[: limits[t.id]] if t.id in limits else t.text for t in out.texts}  # still long: cut
+    keys = {t.id: [k for k in t.key_words if 0 <= k < len(new[t.id].split())] for t in out.texts if t.key_words}
     filled = []
     for t, c in zip(template, out.shots):
         s = t.model_copy(update=c.model_dump())
+        if t.direction and t.direction not in s.direction:  # the template's shot list stays with the new content
+            s.direction = f"{s.direction}; {t.direction}".strip("; ")
         if t.texts:
-            s.texts = [{"id": x["id"], "text": new.get(x["id"], (c.text or x["text"])[: limits.get(x["id"], 10**6)])}
+            s.texts = [{"id": x["id"], "text": new.get(x["id"], (c.text or x["text"])[: limits.get(x["id"], 10**6)]),
+                        **({"key_words": keys[x["id"]]} if keys.get(x["id"]) else {})}
                        for x in t.texts]  # no word for an event: the slot's caption, cut to the event's limit
             s.text = " / ".join(x["text"].replace("\n", " ") for x in s.texts)
         filled.append(s)

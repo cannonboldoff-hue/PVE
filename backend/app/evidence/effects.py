@@ -1,7 +1,8 @@
 """Frame effects. Flash: a brightness jump above FLASH_DELTA lasting 1..FLASH_MAX frames that returns to the level
 before it (frame-exact). RGB split: red and blue planes displaced against each other (phase correlation) in bursts.
-Blur: a burst of low sharpness. Vignette: corners darker than the centre across a whole shot. Grain and glow are
-shot looks the video AI names; they are not measured here."""
+Blur: a burst of low sharpness. Vignette: corners darker than the centre across a whole shot. Glitch: a short RGB
+split burst whose horizontal bands also jump sideways by different amounts (tearing). Grain, glow and scanlines are
+shot looks the video AI names (meaning.effects): at the 160 px analysis width grain and scanlines average away."""
 import cv2
 import numpy as np
 
@@ -9,7 +10,10 @@ from .. import ir
 from . import boundaries
 from .frames import load
 
-NAME, VERSION, DEPS = "effects", 2, ["cuts", "transitions", "text"]
+NAME, VERSION, DEPS = "effects", 3, ["cuts", "transitions", "text"]
+GLITCH_MAX = 8  # frames: an RGB split burst this short that also tears is a glitch
+BANDS = 8  # horizontal bands compared for tearing
+TEAR_PX = 1.5  # spread (std, px at 160 wide) of the bands' sideways jumps that counts as tearing
 FLASH_DELTA = 40.0  # mean luma jump (0..255) that makes a flash
 FLASH_MAX = 4  # longest flash in frames; longer is a cut to a bright shot
 SPLIT_PX = 1.0  # red/blue displacement (px at 160 wide) that counts as RGB split
@@ -46,6 +50,19 @@ def _bursts(flag: np.ndarray) -> list[tuple[int, int]]:
     return out
 
 
+def tears(gray: np.ndarray, f: int) -> bool:
+    """Frame f's horizontal bands moved sideways by different amounts against frame f - 1."""
+    if f < 1:
+        return False
+    h = gray.shape[1]
+    dx = []
+    for k in range(BANDS):
+        a, b = k * h // BANDS, (k + 1) * h // BANDS
+        (x, _), _ = cv2.phaseCorrelate(gray[f - 1, a:b].astype(np.float32), gray[f, a:b].astype(np.float32))
+        dx.append(x)
+    return float(np.std(dx)) > TEAR_PX
+
+
 def run(ctx) -> list[ir.Item]:
     gray, rgb = load(ctx.key)
     gray, rgb = np.asarray(gray), np.asarray(rgb)
@@ -79,7 +96,10 @@ def run(ctx) -> list[ir.Item]:
     edges = [0, *[f for f, _, _ in bs], n]
     for a, b in zip(edges[:-1], edges[1:]):
         for s, e in _bursts(shift[a:b] > SPLIT_PX):
-            add("rgb_split", a + s, a + e, 0.6, px=round(float(shift[a + s:a + e].mean()), 2))
+            px = round(float(shift[a + s:a + e].mean()), 2)
+            torn = e - s <= GLITCH_MAX and sum(tears(gray, f) for f in range(a + s, a + e)) * 2 >= e - s
+            add("glitch" if torn else "rgb_split", a + s, a + e, 0.5 if torn else 0.6,
+                px=round(px * 1080 / 160, 1) if torn else px)
         med = np.median(sharp[a:b]) if b > a else 0
         for s, e in _bursts(sharp[a:b] < BLUR_DROP * med) if med > BLUR_MIN else []:
             if not any(x <= a + s < y for x, y in windows):

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from .. import ir
 
-TRACK_MODULES = ["cuts", "transitions", "text", "text_anim", "camera", "speed", "effects", "layout", "overlays", "colour"]  # grows per milestone
+TRACK_MODULES = ["cuts", "transitions", "text", "text_anim", "camera", "speed", "effects", "layout", "overlays", "colour", "tiles", "masks", "match_cuts"]  # grows per milestone
 EVIDENCE_VERSION = 1
 
 

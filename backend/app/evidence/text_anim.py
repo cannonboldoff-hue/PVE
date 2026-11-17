@@ -12,7 +12,9 @@ from .. import ir
 from ..stages.compare import box_iou, text_similarity
 from .text import ocr, ocr_size, read_frames
 
-NAME, VERSION, DEPS = "text_anim", 5, ["text", "cuts", "transitions"]
+NAME, VERSION, DEPS = "text_anim", 6, ["text", "cuts", "transitions"]
+OVERSHOOT = 0.15  # line heights past the resting box, against the slide direction: the slide bounced
+SETTLE = (2, 4, 6)  # frames after first reaching rest read again, to catch an overshoot
 ANIM_WINDOW = 12  # frames examined each side of the readable span
 DIFF = 60  # summed RGB difference that counts as a glyph pixel
 VISIBLE = 0.1  # presence above this: the text has started to show
@@ -102,6 +104,9 @@ def classify(seq: list[dict], rest: dict, text: str, lines: int) -> tuple[str, i
     dx = ((b.x + b.w / 2) - (rb.x + rb.w / 2)) / lh
     t = g["txt"].lower().replace(" ", "")
     if abs(dy) > MOVE and abs(dy) >= abs(dx):
+        after = [((s["box"].y + s["box"].h / 2) - (rb.y + rb.h / 2)) / lh for s in seq[vis:] if s["box"]]
+        if any(y * dy < 0 and abs(y) > OVERSHOOT for y in after):  # went past the rest and came back
+            return "bounce", seq[vis]["f"], n, 0.7
         return ("slide_up" if dy > 0 else "slide_down"), seq[vis]["f"], n, 0.8
     if abs(dx) > MOVE:
         return ("slide_left" if dx > 0 else "slide_right"), seq[vis]["f"], n, 0.7
@@ -168,6 +173,12 @@ def run(ctx) -> list[ir.Item]:
                 if seq[j]["box"] and classify_resting(seq[j], rest, text):
                     break
                 j += OCR_STEP
+            rb, lh = ir.Box(**rest), rest["h"] / max(1, lines)
+            slid = any(s["box"] and abs((s["box"].y + s["box"].h / 2) - (rb.y + rb.h / 2)) > MOVE * lh for s in seq)
+            if slid and j is not None:  # a slide may overshoot after first reaching the rest: look a little further
+                for extra in SETTLE:
+                    if j + extra < len(seq):
+                        read(j + extra)
             result[side] = classify(seq, rest, text, lines)
         (a_in, start, n_in, c_in), (a_out, last, n_out, c_out) = result["in"], result["out"]
         items.append(ir.Item(id=f"text_anim_{k}", track=NAME, start=min(start, t.start), end=max(last + 1, t.end),

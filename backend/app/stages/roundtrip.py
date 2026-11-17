@@ -52,11 +52,11 @@ def same_shot_plan(t: ir.Template, proxy: str) -> Plan:
 def marker_plan(t: ir.Template, clips: list[str]) -> Plan:
     """Every slot filled with a plain marker clip; the template's transitions, camera and text layer (reference
     words) applied."""
-    from .plan import apply_transitions
+    from .plan import apply_transitions, camera_moves, shake_of, tile_params_of
 
     shots = [PlanShot(shot_id=k + 1, asset_id=f"marker{k + 1}", path=c, src_in=0.0, src_out=ir.f2s(s.frames),
-                      frames=s.frames, shake=s.shake if s.camera.value != "static" else None,
-                      camera_path=[x.model_dump(mode="json") for x in s.camera_path] if s.camera.value != "static" else [])
+                      frames=s.frames, shake=shake_of(s),
+                      camera_path=[x.model_dump(mode="json") for x in s.camera_path] if camera_moves(s, t) else [])
              for k, (s, c) in enumerate(zip(t.slots, clips))]
     texts = []
     for e in t.texts:
@@ -64,10 +64,11 @@ def marker_plan(t: ir.Template, clips: list[str]) -> Plan:
         d["text"]["value"] = e.text.raw or e.text.value
         texts.append(d)
     for ps, sl in zip(shots, t.slots):
-        if sl.speed != [(0.0, 1.0)] or sl.freeze:
-            ps.speed_curve, ps.freeze = list(sl.speed), list(sl.freeze)
+        if sl.speed != [(0.0, 1.0)] or sl.freeze or sl.reverse:
+            ps.speed_curve, ps.freeze, ps.reverse = list(sl.speed), list(sl.freeze), sl.reverse
         if sl.layout.value in ("split_v", "split_h", "pip", "collage", "letterbox", "blur_fill") and sl.layout_boxes:
             ps.layout_boxes = [b.model_dump() for b in sl.layout_boxes]
+            ps.tile_params = tile_params_of(sl)
             ps.fit = "blur_fit" if sl.layout.value == "blur_fill" else ps.fit
     plan = Plan(shots=shots, n_frames=t.n_frames, music_path=t.audio or None, audio_mode="reference",
                 captions=bool(texts), texts=texts, effects=[e.model_dump(mode="json") for e in t.effects if e.render],
@@ -126,9 +127,24 @@ def compare_transitions(ref: list[ir.Transition], got: list[ir.Item]) -> list[ir
                         render=g.end - g.start, gap=abs((g.end - g.start) - (tr.end - tr.start)),
                         ok=abs((g.end - g.start) - (tr.end - tr.start)) <= TRANS_FRAMES_OK),
             ir.DeltaRow(track="transitions", metric=f"{tr.after_slot} class", ref=want, render=g.data["type"],
-                        gap=0 if want == g.data["type"] else 1, ok=want == g.data["type"] or bool(tr.loss)),
+                        gap=0 if want == g.data["type"] else 1,
+                        ok=want == g.data["type"] or bool(tr.loss) or want in UNMEASURED_TRANSITIONS),
         ]
     return rows
+
+
+UNMEASURED_TRANSITIONS = {"glitch", "blur", "other"}  # named by the video AI only: the render cannot measure them back
+MEASURED_EFFECTS = {"flash", "rgb_split", "blur", "vignette", "glitch"}  # what the effects track can find in a render
+
+
+def _measured_in(text_item: ir.Item, anim_item: ir.Item | None) -> str | None:
+    """The in-animation as fusion reads it: word-level measurements (text track) before the text_anim class."""
+    lit, words = text_item.data.get("lit") or [], text_item.data.get("words") or []
+    if len({w["start"] for w in lit}) >= 2:
+        return "word_highlight"
+    if words:
+        return "typewriter"
+    return anim_item.data["in"] if anim_item else None
 
 
 def compare_texts(ref: list[ir.TextEvent], got: list[ir.Item], anims: list[ir.Item]) -> list[ir.DeltaRow]:
@@ -146,6 +162,7 @@ def compare_texts(ref: list[ir.TextEvent], got: list[ir.Item], anims: list[ir.It
             rows.append(ir.DeltaRow(track="text", metric=f"{e.id} found", ref=words, render=None, gap=1, ok=False))
             continue
         a = anim.get(best.id)
+        got_in = _measured_in(best, a)
         start, end = (a.start, a.end) if a else (best.start, best.end)
         sim = text_similarity(words, best.data["text"])
         iou = box_iou(e.keys[0].box, best.data.get("style", {}).get("ink") or best.data["box"])
@@ -158,9 +175,8 @@ def compare_texts(ref: list[ir.TextEvent], got: list[ir.Item], anims: list[ir.It
                         ok=abs(start - e.start) <= TEXT_FRAMES_OK),
             ir.DeltaRow(track="text", metric=f"{e.id} end frame", ref=e.end, render=end, gap=abs(end - e.end),
                         ok=abs(end - e.end) <= TEXT_FRAMES_OK),
-            ir.DeltaRow(track="text_anim", metric=f"{e.id} in", ref=e.anim_in.value,
-                        render=a.data["in"] if a else None, gap=0 if a and a.data["in"] == e.anim_in.value else 1,
-                        ok=bool(a) and a.data["in"] == e.anim_in.value),
+            ir.DeltaRow(track="text_anim", metric=f"{e.id} in", ref=e.anim_in.value, render=got_in,
+                        gap=0 if got_in == e.anim_in.value else 1, ok=got_in == e.anim_in.value),
             ir.DeltaRow(track="text_anim", metric=f"{e.id} out", ref=e.anim_out.value,
                         render=a.data["out"] if a else None, gap=0 if a and a.data["out"] == e.anim_out.value else 1,
                         ok=bool(a) and a.data["out"] == e.anim_out.value),
@@ -264,8 +280,8 @@ def compare_speed(slots: list[ir.Slot], got: list[ir.Item]) -> list[ir.DeltaRow]
 def compare_effects(ref: list[ir.Effect], got: list[ir.Item]) -> list[ir.DeltaRow]:
     rows = []
     for e in ref:
-        if not e.render:
-            continue  # not drawn: a recorded loss, not a gap
+        if not e.render or e.type.value not in MEASURED_EFFECTS:
+            continue  # not drawn (a recorded loss), or drawn but not measurable (camera punch, video-AI looks)
         same = [i for i in got if i.data["type"] == e.type.value]
         g = min(same, key=lambda i: abs(i.start - e.start), default=None)
         err = abs(g.start - e.start) + abs(g.end - e.end) if g else e.end - e.start

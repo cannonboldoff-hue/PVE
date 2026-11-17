@@ -15,6 +15,8 @@ def stats(rgb: np.ndarray, mask: np.ndarray | None = None) -> dict:
     lab = cv2.cvtColor(rgb.reshape(-1, rgb.shape[-2], 3), cv2.COLOR_RGB2LAB).reshape(rgb.shape).astype(np.float32)
     hsv = cv2.cvtColor(rgb.reshape(-1, rgb.shape[-2], 3), cv2.COLOR_RGB2HSV).reshape(rgb.shape).astype(np.float32)
     m = np.broadcast_to(mask, rgb.shape[:3]) if mask is not None else np.ones(rgb.shape[:3], bool)
+    if not m.any():  # text/overlay boxes cover the whole frame: use unmasked pixels rather than none
+        m = np.ones(rgb.shape[:3], bool)
     L, A, B, S = lab[..., 0][m], lab[..., 1][m], lab[..., 2][m], hsv[..., 1][m]
     return {"l_mean": float(L.mean()), "l_std": float(L.std()), "a_mean": float(A.mean()), "a_std": float(A.std()),
             "b_mean": float(B.mean()), "b_std": float(B.std()), "saturation": float(S.mean() / 255),

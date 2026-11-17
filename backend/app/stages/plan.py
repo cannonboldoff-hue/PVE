@@ -7,6 +7,28 @@ from ..models import CaptionStyle, Match, PatchOp, Plan, PlanShot, ShotSpec
 CAP_PAD = 0.2
 
 
+def shake_of(s) -> dict | list | None:
+    """What the renderer shakes for an ir.Slot: the measured windows when there are any, else the slot summary."""
+    return [w.model_dump() for w in s.shake_windows] or s.shake or None
+
+
+def camera_moves(s, template) -> bool:
+    """The slot's view path is worth redoing: a classified move, or a measured zoom punch inside a static shot
+    (path noise on a static shot is not redone)."""
+    if s.camera.value != "static":
+        return True
+    return bool(s.camera_path) and any(e.type.value == "zoom_punch" and s.start <= e.start < s.end
+                                       for e in template.effects)
+
+
+def tile_params_of(s) -> list[dict]:
+    """Every box of a multi-box ir.Slot with its own measured timing and motion (empty: boxes use the slot's)."""
+    return [{"speed_curve": list(t.speed), "freeze": list(t.freeze), "reverse": t.reverse or (k == 0 and s.reverse),
+             "camera_path": [x.model_dump(mode="json") for x in t.camera_path] if t.camera != "static" else [],
+             "shake": [w.model_dump() for w in t.shake_windows] or None}
+            for k, t in enumerate(s.tiles)]
+
+
 def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music_path: str | None, captions: bool,
           template=None) -> Plan:
     """template (ir.Template): frame-exact timing pinned to the reference; skipped slots' frames go to a neighbour
@@ -42,14 +64,16 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
             slot = template.slots[s.shot_id - 1]
             if slot.speed != [(0.0, 1.0)] or slot.freeze or slot.reverse:  # speed ramp, freeze, reverse
                 ps.speed_curve, ps.freeze, ps.reverse = list(slot.speed), list(slot.freeze), slot.reverse
-            if slot.camera.value != "static":  # the reference's camera move, redone on the new clip
+            if camera_moves(slot, template):  # the reference's camera move, redone on the new clip
                 ps.camera_path = [k.model_dump(mode="json") for k in slot.camera_path]
-                ps.shake = slot.shake
+            ps.shake = shake_of(slot)  # shake also sits on otherwise static shots (zoom + shake, shake on a hit)
         lay = template.slots[s.shot_id - 1].layout if template else None
         boxes = template.slots[s.shot_id - 1].layout_boxes if template else []
         if lay is not None and lay.value in ("split_v", "split_h", "pip", "collage", "letterbox", "blur_fill") and boxes:
             ps.layout_boxes = [b.model_dump() for b in boxes]  # the reference's own boxes, one clip each
             ps.tiles = [assets[a]["path"] for a in m.extra_assets if a in assets][: len(boxes) - 1]
+            ps.tile_params = tile_params_of(template.slots[s.shot_id - 1])
+            _continue_tiles(ps, out[-1] if out else None, template.slots[s.shot_id - 1])
             ps.fit = "blur_fit" if lay.value == "blur_fill" else ps.fit
 
         elif s.layout == "collage":
@@ -58,6 +82,8 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
                 ps.collage, ps.tiles = s.collage, tiles
         if template and template.slots[s.shot_id - 1].colour:
             ps.colour = template.slots[s.shot_id - 1].colour.model_dump()
+        if template and not ps.layout_boxes:
+            ps.mask = slot_mask(template, template.slots[s.shot_id - 1])
         _fit_caption(ps)
         _custom_caption_timing(ps, s)
         out.append(ps)
@@ -67,8 +93,57 @@ def build(shots: list[dict], matches: list[dict], assets: dict[str, dict], music
         assert sum(p.frames for p in out) == template.n_frames, "slot frames must add up to the reference length"
         plan.texts = plan_texts(template, shots) if captions else []
         plan.effects = [e.model_dump(mode="json") for e in template.effects if e.render]
+        plan.layer_clips = layer_clips(template, out, by_shot, assets)
         apply_transitions(plan, template)
     return plan
+
+
+def slot_mask(template, slot) -> dict | None:
+    """The slot's shape mask (frames relative to the slot), when the template has one there."""
+    x = next((x for x in template.layers if x.kind.value == "shape_mask" and x.render and x.keys
+              and slot.start <= x.start < slot.end), None)
+    if x is None:
+        return None
+    return {"shape": x.shape, "bg": x.bg, "keys": [{"frame": k.frame - slot.start, "box": k.box.model_dump()}
+                                                   for k in x.keys]}
+
+
+def layer_clips(template, shots: list[PlanShot], by_shot: dict, assets: dict) -> list[dict]:
+    """Cut-out and moving layers: each takes the next extra clip the user supplied for its slot after the slot's
+    layout tiles (a cut-out wants a clip with alpha). Layers without a supplied clip are not drawn (their loss says so)."""
+    out = []
+    for p in shots:
+        slot = template.slots[p.shot_id - 1]
+        m = by_shot.get(p.shot_id)
+        spare = [assets[a]["path"] for a in (m.extra_assets if m else []) if a in assets][len(p.tiles):]
+        for x in template.layers:
+            if x.kind.value not in ("cutout", "moving_layer") or not x.keys or not slot.start <= x.start < slot.end:
+                continue
+            if not spare:
+                break
+            out.append({"path": spare.pop(0), "start": x.start, "end": x.end, "above_text": x.above_text,
+                        "keys": [{"frame": k.frame, "box": k.box.model_dump()} for k in x.keys]})
+    return out
+
+
+def _continue_tiles(ps: PlanShot, prev: PlanShot | None, slot) -> None:
+    """A box that keeps playing across the cut takes the previous shot's clip for that box, from where it stopped."""
+    if prev is None or prev.shot_id != ps.shot_id - 1 or len(prev.layout_boxes) != len(ps.layout_boxes):
+        return
+    # shortcut: assumes the box played at 1x in the previous shot; use shot.footage() of its curve if ramps show up
+    secs = (prev.frames or 0) / 30
+    for t in slot.tiles:
+        if not t.continues or t.box >= len(ps.tile_params):
+            continue
+        if t.box == 0:
+            ps.asset_id, ps.path, ps.src_in = prev.asset_id, prev.path, prev.src_in + secs
+            ps.src_out = ps.src_in + ps.duration
+        elif t.box - 1 < len(prev.tiles):
+            while len(ps.tiles) < t.box:
+                ps.tiles.append(prev.tiles[len(ps.tiles)] if len(ps.tiles) < len(prev.tiles) else prev.path)
+            ps.tiles[t.box - 1] = prev.tiles[t.box - 1]
+            prev_in = float((prev.tile_params[t.box] if t.box < len(prev.tile_params) else {}).get("in") or 0.0)
+            ps.tile_params[t.box]["in"] = prev_in + secs
 
 
 def apply_transitions(plan: Plan, template) -> None:
@@ -97,17 +172,20 @@ def apply_transitions(plan: Plan, template) -> None:
 def plan_texts(template, shots: list[dict]) -> list[dict]:
     """Template text events with the new words from the filled shots. A slot whose only event was edited through
     the shot card's single text field takes that edit."""
-    words = {}
+    words, keys = {}, {}
     for raw in shots:
         s = ShotSpec(**raw)
         evs = s.texts
         if len(evs) == 1 and s.text.strip() and s.text.strip() != evs[0]["text"].replace("\n", " ").strip():
             evs = [{**evs[0], "text": s.text.strip()}]
         words |= {x["id"]: x["text"] for x in evs}
+        keys |= {x["id"]: x["key_words"] for x in evs if x.get("key_words")}
     out = []
     for e in template.texts:
         d = e.model_dump(mode="json")
         d["text"]["value"] = words.get(e.id, e.text.value)
+        if e.id in keys:
+            d["key_words"] = keys[e.id]
         out.append(d)
     return out
 

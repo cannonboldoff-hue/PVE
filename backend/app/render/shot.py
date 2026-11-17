@@ -50,11 +50,29 @@ def _lerp(keys: list[tuple[int, float]]) -> str:
     return expr
 
 
-def camera_chain(path: list[dict], shake: dict | None) -> str:
+def shake_windows(shake: dict | list | None) -> list[dict]:
+    """Shake as a list of {amp, hz[, start, end]} (frames relative to the slot). A plain dict is one window over the
+    whole slot; a window without start / end is ungated."""
+    ws = [shake] if isinstance(shake, dict) else list(shake or [])
+    return [w for w in ws if float(w.get("amp") or 0) > 0 and float(w.get("hz") or 0) > 0]
+
+
+def _jitter(windows: list[dict]) -> tuple[str, str]:
+    """Deterministic shake offsets: two incommensurate sines per window at its amplitude and rate, gated to it."""
+    jx, jy = [], []
+    for w in windows:
+        amp, hz = float(w["amp"]), float(w["hz"])
+        gate = f"between(on,{int(w['start'])},{int(w['end']) - 1})*" if "start" in w and "end" in w else ""
+        jx.append(f"{gate}{amp:.5f}*(sin(2*PI*{hz:.3f}*on/{FPS})+0.6*sin(2*PI*{hz * 1.7:.3f}*on/{FPS}+1.3))/1.6")
+        jy.append(f"{gate}{amp:.5f}*(sin(2*PI*{hz * 1.3:.3f}*on/{FPS}+0.7)+0.6*sin(2*PI*{hz * 2.1:.3f}*on/{FPS}))/1.6")
+    return "+".join(jx), "+".join(jy)
+
+
+def camera_chain(path: list[dict], shake: dict | list | None, w_out: int = W, h_out: int = H) -> str:
     """Reproduce a measured view path (ir.Key dicts: frame relative to the slot, box = visible region) and shake.
     The path is rescaled so its widest view is the whole frame (a zoom out starts zoomed in)."""
-    amp = float((shake or {}).get("amp") or 0.0)
-    hz = float((shake or {}).get("hz") or 0.0)
+    windows = shake_windows(shake)
+    amp = max((float(w["amp"]) for w in windows), default=0.0)
     ws = [k["box"]["w"] for k in path] or [1.0]
     m = max(ws) / max(1e-6, 1 - 4 * amp)  # shake needs a margin inside the frame
     keys = []
@@ -65,21 +83,21 @@ def camera_chain(path: list[dict], shake: dict | None) -> str:
         keys.append((k["frame"], w, cx, cy))
     wexp = _lerp([(f, w) for f, w, _, _ in keys])
     cxe, cye = _lerp([(f, c) for f, _, c, _ in keys]), _lerp([(f, c) for f, _, _, c in keys])
-    if amp > 0 and hz > 0:  # deterministic: two incommensurate sines at the measured amplitude and rate
-        jx = f"{amp:.5f}*(sin(2*PI*{hz:.3f}*on/{FPS})+0.6*sin(2*PI*{hz * 1.7:.3f}*on/{FPS}+1.3))/1.6"
-        jy = f"{amp:.5f}*(sin(2*PI*{hz * 1.3:.3f}*on/{FPS}+0.7)+0.6*sin(2*PI*{hz * 2.1:.3f}*on/{FPS}))/1.6"
+    if windows:
+        jx, jy = _jitter(windows)
         cxe, cye = f"({cxe})+{jx}", f"({cye})+{jy}"
-    return (f"scale={W * UP}:{H * UP},zoompan=z='1/({wexp})':x='(({cxe})-({wexp})/2)*iw':"
-            f"y='(({cye})-({wexp})/2)*ih':d=1:s={W}x{H}:fps={FPS}")
+    return (f"scale={w_out * UP}:{h_out * UP},zoompan=z='1/({wexp})':x='(({cxe})-({wexp})/2)*iw':"
+            f"y='(({cye})-({wexp})/2)*ih':d=1:s={w_out}x{h_out}:fps={FPS}")
 
 
-def motion_chain(animation: str, frames: int, path: list[dict] | None = None, shake: dict | None = None) -> str:
-    if path or (shake and shake.get("amp")):
-        return camera_chain(path or [{"frame": 0, "box": {"x": 0, "y": 0, "w": 1, "h": 1}}], shake)
+def motion_chain(animation: str, frames: int, path: list[dict] | None = None, shake: dict | list | None = None,
+                 w_out: int = W, h_out: int = H) -> str:
+    if path or shake_windows(shake):
+        return camera_chain(path or [{"frame": 0, "box": {"x": 0, "y": 0, "w": 1, "h": 1}}], shake, w_out, h_out)
     if animation not in ("zoom_in", "zoom_out"):
         return ""
     z = f"1+{ZOOM_PER_FRAME}*on" if animation == "zoom_in" else f"1+{ZOOM_PER_FRAME}*({frames - 1}-on)"
-    return f"zoompan=z='{z}':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={W}x{H}:fps={FPS}"
+    return f"zoompan=z='{z}':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={w_out}x{h_out}:fps={FPS}"
 
 
 def grade_chain(g: dict | None) -> str:
@@ -139,18 +157,70 @@ def timing_chain(pcs: list[tuple[int, int, float, float]]) -> str:
     return out + (f",tpad=start_mode=clone:start={hold}" if hold else "")
 
 
-def chain(params: dict, skip: int) -> str:
+def chain(params: dict, skip: int, size: tuple[int, int] | None = None) -> str:
+    """One source through speed, fit, reverse, motion and colour. size: a layout tile (bw, bh) instead of the
+    whole frame; tiles are covered into their box and graded once on the composite, not here."""
     frames, speed = params["frames"], max(MIN_SPEED, float(params.get("speed") or 1.0))
     curve = [(p, f * speed) for p, f in (params.get("speed_curve") or [(0.0, 1.0)])]
     pcs = pieces(frames, curve, params.get("freeze"))
     need = footage(frames, curve, params.get("freeze")) + 1
+    bw, bh = size or (W, H)
+    fit = fit_chain(params.get("fit", "cover")) if size is None else \
+        f"scale={bw}:{bh}:force_original_aspect_ratio=increase:force_divisible_by=2,crop={bw}:{bh}"
     steps = [f"fps={FPS}", f"trim=start_frame={skip}:end_frame={skip + need}", "setpts=PTS-STARTPTS",
-             fit_chain(params.get("fit", "cover")), "reverse" if params.get("reverse") else "", timing_chain(pcs)]
+             fit, "reverse" if params.get("reverse") else "", timing_chain(pcs)]
     steps += [
-              motion_chain(params.get("animation", "none"), frames, params.get("camera_path"), params.get("shake")),
-              params.get("colour_filter") or grade_chain(params.get("grade")), "setsar=1", "format=yuv420p",
+              motion_chain(params.get("animation", "none"), frames, params.get("camera_path"), params.get("shake"), bw, bh),
+              "" if size else params.get("colour_filter") or grade_chain(params.get("grade")),
+              "" if size else mask_chain(params.get("mask")), "setsar=1",
+              "format=yuv420p",
               f"tpad=stop_mode=clone:stop={frames}"]  # source too short even after slowing: hold the last frame
     return ",".join(s for s in steps if s)
+
+
+def _yuv(hex_: str) -> tuple[int, int, int]:
+    """BT.601 limited-range Y, Cb, Cr of an #RRGGBB colour (what yuv420p stores)."""
+    r, g, b = (int(hex_[k:k + 2], 16) / 255 for k in (1, 3, 5))
+    return (round(16 + 65.481 * r + 128.553 * g + 24.966 * b), round(128 - 37.797 * r - 74.203 * g + 112 * b),
+            round(128 + 112 * r - 93.786 * g - 18.214 * b))
+
+
+def _lerp_n(keys: list[tuple[int, float]]) -> str:
+    return _lerp(keys).replace("on", "N")
+
+
+def mask_chain(mask: dict | None) -> str:
+    """Show the footage only inside the mask's shape; outside, the reference's flat background colour. The box moves
+    between keys (slot-relative frames). geq expressions use plane-normalised X/W, Y/H, so chroma planes agree."""
+    keys = sorted((mask or {}).get("keys") or [], key=lambda k: k["frame"])
+    if not keys:
+        return ""
+    cx = _lerp_n([(k["frame"], k["box"]["x"] + k["box"]["w"] / 2) for k in keys])
+    cy = _lerp_n([(k["frame"], k["box"]["y"] + k["box"]["h"] / 2) for k in keys])
+    rx = _lerp_n([(k["frame"], k["box"]["w"] / 2) for k in keys])
+    ry = _lerp_n([(k["frame"], k["box"]["h"] / 2) for k in keys])
+    u, v = f"(X/W-({cx}))/({rx})", f"(Y/H-({cy}))/({ry})"
+    inside = {
+        "rect": f"lte(abs({u}),1)*lte(abs({v}),1)",
+        "rounded_rect": f"lte(pow(abs({u}),4)+pow(abs({v}),4),1)",
+        "heart": f"lte(pow(pow(1.2*{u},2)+pow(0.2-1.2*{v},2)-1,3)-pow(1.2*{u},2)*pow(0.2-1.2*{v},3),0)",
+    }.get(mask.get("shape") or "", f"lte(pow({u},2)+pow({v},2),1)")  # circle / ellipse
+    y, cb, cr = _yuv(mask.get("bg") or "#000000")
+    return (f"format=yuv420p,geq=lum='if({inside},lum(X,Y),{y})':cb='if({inside},cb(X,Y),{cb})':"
+            f"cr='if({inside},cr(X,Y),{cr})'")
+
+
+TILE_KEYS = ("speed_curve", "freeze", "reverse", "camera_path", "shake")
+
+
+def tile_params(params: dict, k: int) -> dict:
+    """Box k's own timing and motion from params["tile_params"][k] (measured per box); without it box 0 takes the
+    slot's and the other boxes play at 1x, still. The plan's slow-down factor (short clip) stays with box 0."""
+    own = (params.get("tile_params") or [])[k:k + 1]
+    if k == 0 and not own:
+        return params
+    base = {x: v for x, v in params.items() if x not in TILE_KEYS and (k == 0 or x != "animation")}
+    return {**base, "speed": params.get("speed", 1.0) if k == 0 else 1.0, **(own[0] if own else {})}
 
 
 MAX_SHIFT = 0.35  # colour match: contrast / saturation factors stay within 1 +- this, brightness within +- this / 2
@@ -201,12 +271,7 @@ def layout_graph(params: dict, inputs: list[tuple[str, float]], frames: int) -> 
     for k, (box, (_, skip)) in enumerate(zip(params["layout_boxes"], inputs)):
         bw, bh = max(2, round(box["w"] * W / 2) * 2), max(2, round(box["h"] * H / 2) * 2)
         x, y = round(box["x"] * W), round(box["y"] * H)
-        pcs = pieces(frames, params.get("speed_curve"), params.get("freeze")) if k == 0 else pieces(frames)
-        need = footage(frames, params.get("speed_curve"), params.get("freeze")) + 1 if k == 0 else frames + 1
-        steps = [f"fps={FPS}", f"trim=start_frame={skip}:end_frame={skip + need}", "setpts=PTS-STARTPTS",
-                 f"scale={bw}:{bh}:force_original_aspect_ratio=increase:force_divisible_by=2,crop={bw}:{bh}",
-                 timing_chain(pcs) if k == 0 else "", f"tpad=stop_mode=clone:stop={frames}", "setsar=1"]
-        parts.append(f"[{k}:v]" + ",".join(x_ for x_ in steps if x_) + f"[s{k}]")
+        parts.append(f"[{k}:v]" + chain({**tile_params(params, k), "frames": frames}, skip, (bw, bh)) + f"[s{k}]")
         parts.append(f"[{last}][s{k}]overlay={x}:{y}:eof_action=repeat[c{k + 1}]")
         last = f"c{k + 1}"
     tail = [params.get("colour_filter") or grade_chain(params.get("grade")), "setsar=1", "format=yuv420p"]
@@ -225,7 +290,8 @@ def prep(params: dict, out: Path) -> None:
     if params.get("layout_boxes"):
         boxes = params["layout_boxes"]
         tiles = list(params.get("tile_paths") or [])
-        srcs = [(src, src_in)] + [(tiles[k - 1] if k - 1 < len(tiles) else src, 0.0 if k - 1 < len(tiles) else src_in)
+        tin = [float(tp.get("in") or 0.0) for tp in params.get("tile_params") or []]
+        srcs = [(src, src_in)] + [(tiles[k - 1], tin[k] if k < len(tin) else 0.0) if k - 1 < len(tiles) else (src, src_in)
                                   for k in range(1, len(boxes))]  # too few clips: the main clip fills the rest
         if params.get("fit") == "blur_fit":
             srcs.append(srcs[0])

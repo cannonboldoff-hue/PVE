@@ -13,9 +13,13 @@ EVIDENCE_OWNER = {"media": "still", "camera": "camera", "layout": "layout"}
 CONFLICT_FACTOR = 0.5  # owner's conf is multiplied by this when the other source disagrees
 UNMEASURED_FACTOR = 0.7
 LAYER_CONF = 0.4  # ceiling for a layer only the video AI saw
-LAYER_LOSS = {"shape_mask": "shape mask not rendered: the new footage fills the frame",
-              "cutout": "cutout not rendered: the new footage keeps its background",
-              "moving_layer": "moving layer not rendered", "other": "layer not rendered"}
+LAYER_LOSS = {"shape_mask": "", "cutout": "cutout: drawn only when the shot's cut-out clip (alpha) is supplied",
+              "moving_layer": "moving layer: drawn only when the layer's picture or clip is supplied",
+              "other": "layer not rendered"}
+LAYER_RENDER = {"shape_mask": "ffmpeg:geq", "cutout": "overlay:layer", "moving_layer": "overlay:layer", "other": ""}
+MASK_SHAPES = ("circle", "ellipse", "rect", "rounded_rect", "heart")
+MEASURED_LAYER_CONF = 0.7
+MATCH_CUT_CONF = 0.6  # the video AI's match cut is believed from this confidence
 SURE_CLASS = 0.8  # a measured transition class at or above this keeps its name over the model's  # evidence-owned field with no measurement yet: the model's value, trusted less
 
 
@@ -45,6 +49,7 @@ class Observed(BaseModel):
     narrative: dict = Field(default_factory=dict)
     style: list[dict] = Field(default_factory=list)  # legacy per-slot style notes for styles.py
     conflicts: list[Conflict] = Field(default_factory=list)
+    dropped: dict[str, str] = Field(default_factory=dict)  # evidence id -> why no template field uses it
 
 
 def slots_from_cuts(source: ir.Source, ev: ir.Evidence) -> tuple[list[ir.Slot], list[ir.Transition]]:
@@ -122,8 +127,62 @@ def layers_from_meaning(meaning: list[SlotMeaning] | None) -> list[ir.Layer]:
                                                      source=m.provider),
                                 keys=[ir.Key(frame=m.start, box=box), *([ir.Key(frame=m.end - 1, box=end)]
                                                                        if end != box else [])],
-                                loss=LAYER_LOSS[kind]))
+                                above_text=bool(x.get("in_front_of_text")) and kind == "cutout",
+                                render=LAYER_RENDER[kind], loss=LAYER_LOSS[kind]))
     return out
+
+
+def mask_shape(word: str, fill: float | None = None) -> tuple[str, str]:
+    """(shape the renderer draws, loss) from the video AI's word, or the measured fill share of the box."""
+    w = word.lower().replace(" ", "_").replace("-", "_")
+    for s in ("rounded_rect", "heart", "circle", "ellipse", "oval", "rect", "square"):
+        if s in w:
+            return {"oval": "ellipse", "square": "rect"}.get(s, s), ""
+    if fill is not None:
+        return ("rect" if fill > 0.9 else "ellipse"), ""
+    return "ellipse", f"shape '{word}' drawn as an ellipse" if word else ""
+
+
+def measured_layers(ev: ir.Evidence, slots: list[ir.Slot], layers: list[ir.Layer], key: str | None,
+                    dropped: dict[str, str]) -> None:
+    """Back the video AI's layers with measurements: a shape mask takes the measured box and background; a mask
+    nobody named but clearly not a rectangle (letterbox and splits are) is added; moving layers are tracked."""
+    for i in ev.track("masks"):
+        slot = next((s for s in slots if s.start <= i.start < s.end), None)
+        said = next((x for x in layers if x.kind.value == "shape_mask" and x.start < i.end and x.end > i.start), None)
+        if said is None and (i.data.get("fill", 1) > 0.88 or (slot and slot.layout.value not in ("single", "other"))):
+            dropped[i.id] = "flat static border around a rectangle: a layout (letterbox / split), not a shape mask"
+            continue
+        box = ir.Box(**i.data["box"])
+        shape, loss = mask_shape(said.shape if said else "", i.data.get("fill"))
+        if said is None:
+            said = ir.Layer(id=f"l{len(layers) + 1:02d}", start=i.start, end=i.end, keys=[],
+                            kind=F[ir.LayerKind](value="shape_mask", conf=0.0, source="masks"),
+                            render=LAYER_RENDER["shape_mask"])
+            layers.append(said)
+        said.keys, said.shape, said.bg, said.loss = [ir.Key(frame=i.start, box=box)], shape, i.data.get("bg"), loss
+        said.kind.conf = max(said.kind.conf, MEASURED_LAYER_CONF)
+        said.kind.evidence.append(i.id)
+    for x in layers:
+        if x.kind.value == "shape_mask" and not x.kind.evidence:
+            x.shape, x.loss = mask_shape(x.shape)
+    if not key:
+        return
+    moving = [x for x in layers if x.kind.value in ("moving_layer", "cutout") and x.keys]
+    if not moving:
+        return
+    try:
+        from ..evidence import masks
+        from ..evidence.frames import load
+
+        _, rgb = load(key)
+    except Exception:  # no proxy (tests, a dropped reference): keep the video AI's two keys
+        return
+    for x in moving:
+        path = masks.track_box(rgb[x.start:x.end], x.keys[0].box)
+        if len(path) > 2:
+            x.keys = [ir.Key(frame=x.start + f, box=b) for f, b in path]
+            x.kind.conf = max(x.kind.conf, 0.5)
 
 
 def _measured(ev: ir.Evidence, track: str, slot: ir.Slot) -> ir.Item | None:
@@ -146,6 +205,18 @@ def max_chars(text: str, box_w: float, frames: int) -> int:
     return max(len(text), min(width_cap, read_cap))
 
 
+TILT_MIN = 8.0  # degrees of 3D tilt the video AI must report before the text is drawn tilted
+# video AI words for an animation the pixels could not tell apart from a fade
+ANIM_NOTE = {"bounce": "bounce", "highlight": "word_highlight"}
+REVERSE_CONF = 0.6  # the video AI's "plays backwards" is believed from this confidence (nothing measures it)
+AI_EFFECT_CONF = 0.5  # ... and an effect it names, when no measurement covers that type there
+
+
+def _note_anim(note) -> str:
+    n = str(note or "").lower()
+    return next((k for k in ANIM_NOTE if k in n), "")
+
+
 def texts_from_evidence(ev: ir.Evidence, meaning: list[SlotMeaning] | None = None) -> list[ir.TextEvent]:
     from . import styles
 
@@ -164,17 +235,32 @@ def texts_from_evidence(ev: ir.Evidence, meaning: list[SlotMeaning] | None = Non
         ids = [i.id, *([a.id] if a else [])]
         anim_in = a.data["in"] if a else "none"
         anim_out = a.data["out"] if a else "none"
+        in_conf, in_src = (a.data["in_conf"] if a else 0.3), "text_anim"
+        lit, revealed = i.data.get("lit") or [], i.data.get("words") or []
+        words = [ir.Word(i=w["i"], start=w["start"], fill=w.get("fill")) for w in (lit or revealed)]
+        if lit and len({w["start"] for w in lit}) >= 2:  # measured: the colour moves through the words
+            anim_in, in_conf, in_src = "word_highlight", 0.75, "text"
+        elif revealed:  # measured: whole words appear one after another
+            anim_in, in_conf, in_src = "typewriter", 0.75, "text"
+        elif anim_in in ("none", "fade") and (note := ANIM_NOTE.get(_note_anim(t.get("anim_note")))):
+            anim_in, in_conf, in_src = note, 0.3, m.provider if m else ""  # the video AI's word, measurement silent
+        rot = float(i.data.get("rotation") or 0.0)
+        by_frame = {int(f): a_ for f, a_ in i.data.get("angles", [])}
+        tilt = {"rx": float(t.get("tilt_x") or 0), "ry": float(t.get("tilt_y") or 0)}
         out.append(ir.TextEvent(
             id=f"t{k + 1:02d}", start=start, end=end,
             text=F[str](value=i.data["text"], raw=i.data["text"], conf=i.conf, source="ocr", evidence=ids, binding="swap"),
             role=F[ir.TextRole](value=role, raw=t.get("role"), conf=0.7 if t else 0.3, source=m.provider if m else ""),
-            keys=[ir.Key(frame=i.data.get("steady", i.start), box=box),
-                  *[ir.Key(frame=f, box=ir.Box(x=x, y=y, w=w, h=h)) for f, x, y, w, h in i.data.get("boxes", [])]],
+            keys=[ir.Key(frame=i.data.get("steady", i.start), box=box, rotation=rot),
+                  *[ir.Key(frame=f, box=ir.Box(x=x, y=y, w=w, h=h), rotation=by_frame.get(int(f), rot) if rot else 0.0)
+                    for f, x, y, w, h in i.data.get("boxes", [])]],
             style=ir.TextStyle(font_class=fclass or "sans", font=font, size=st.get("size", box.h),
                                fill=st.get("fill") or "#FFFFFF", outline=st.get("outline"), box=st.get("box"),
                                align=st.get("align", "center")),
-            anim_in=F[ir.TextAnim](value=anim_in, raw=t.get("anim_note"), conf=a.data["in_conf"] if a else 0.3,
-                                   source="text_anim", evidence=ids[1:]),
+            words=words, highlight=i.data.get("highlight"),
+            perspective=tilt if abs(tilt["rx"]) >= TILT_MIN or abs(tilt["ry"]) >= TILT_MIN else None,
+            anim_in=F[ir.TextAnim](value=anim_in, raw=t.get("anim_note"), conf=in_conf,
+                                   source=in_src, evidence=ids[1:] if in_src == "text_anim" else [i.id]),
             anim_out=F[ir.TextAnim](value=anim_out, conf=a.data["out_conf"] if a else 0.3, source="text_anim",
                                     evidence=ids[1:]),
             anim_in_frames=a.data["in_frames"] if a else 0, anim_out_frames=a.data["out_frames"] if a else 0,
@@ -251,4 +337,81 @@ def fuse(source: ir.Source, ev: ir.Evidence, meaning: list[SlotMeaning] | None =
                                        scale=sc, rotation=rot) for f, sc, cx, cy, rot in cam.data.get("path", [])]
             shake = cam.data.get("shake") or {}
             slot.shake = shake if slot.camera.value in ("shake", "handheld") or shake.get("amp", 0) > 0.003 else None
+            slot.shake_windows = [ir.ShakeWindow(start=int(a), end=int(b), amp=amp, hz=hz)
+                                  for a, b, amp, hz in cam.data.get("shake_windows", [])]
+            if slot.shake_windows:  # it shakes in bursts: the windows say where, the summary would shake it all
+                slot.shake = None
+            for a, p, b, ratio in cam.data.get("punches", []):  # drawn by the camera path; listed so it is named
+                obs.effects.append(ir.Effect(
+                    id=f"e{len(obs.effects) + 1:02d}", start=cam.start + int(a), end=cam.start + int(b) + 1,
+                    type=F[ir.EffectType](value="zoom_punch", raw={"peak": cam.start + int(p), "scale": ratio},
+                                          conf=0.7, source="camera", evidence=[cam.id]),
+                    strength=ratio, params={"peak": cam.start + int(p), "scale": ratio}, render="camera"))
+        if m and m.reverse and m.reverse.value == "yes" and m.reverse.confidence >= REVERSE_CONF:
+            slot.reverse = True  # reverse shake = this plus the shake windows
+        if m:
+            effects_from_meaning(obs, m, slot)
+        tiles = _measured(ev, "tiles", slot)
+        if tiles is not None and len(slot.layout_boxes) > 1:
+            slot.tiles = [ir.Tile(box=t["box"], speed=[tuple(x) for x in t.get("curve", [(0.0, 1.0)])],
+                                  freeze=[tuple(x) for x in t.get("freeze", [])], camera=t.get("camera", "static"),
+                                  camera_path=[ir.Key(frame=int(f), box=ir.Box(x=cx - 0.5 / sc, y=cy - 0.5 / sc,
+                                                                               w=1 / sc, h=1 / sc), scale=sc, rotation=rot)
+                                               for f, sc, cx, cy, rot in t.get("path", [])],
+                                  shake_windows=[ir.ShakeWindow(start=int(a), end=int(b), amp=amp, hz=hz)
+                                                 for a, b, amp, hz in t.get("shake_windows", [])],
+                                  continues=bool(t.get("continues")))
+                          for t in tiles.data["tiles"]]
+            slot.evidence.append(tiles.id)
+        for x in (m.tiles if m else []):  # what each box shows, for the shot list
+            if 0 <= x["box"] < len(slot.tiles):
+                slot.tiles[x["box"]].role = str(x.get("role") or "")
+    measured_layers(ev, slots, obs.layers, source.key, obs.dropped)
+    used = {x for s in slots for x in s.evidence}
+    for i in ev.track("tiles"):  # a tiles item whose slot's layout ended up single: nothing uses its boxes
+        if i.id not in used:
+            obs.dropped[i.id] = "per-box motion of a layout the slot did not keep"
+    match_cuts(ev, slots, trans, by_slot)
     return obs
+
+
+def match_cuts(ev: ir.Evidence, slots: list[ir.Slot], trans: list[ir.Transition], by_slot: dict) -> None:
+    """Flag the boundaries where the subject stays put while the scene changes, measured or named by the video AI."""
+    measured = {i.data["frame"]: i for i in ev.track("match_cuts")}
+    for k, t in enumerate(trans):
+        nxt = slots[k + 1] if k + 1 < len(slots) else None
+        if nxt is None:
+            continue
+        i = measured.get(nxt.start)
+        said = getattr(by_slot.get(nxt.id), "match_cut_in", None)
+        ai = bool(said and said.value == "yes" and said.confidence >= MATCH_CUT_CONF)
+        if i is None and not ai:
+            continue
+        t.params["match_cut"] = True
+        t.params["match_conf"] = round(min(1.0, (i.conf if i else 0) + (0.3 if ai else 0) + (0.2 if i and ai else 0)), 2)
+        if i is not None:
+            t.params["match_box"] = i.data["box"]
+            t.type.evidence.append(i.id)
+
+
+def effects_from_meaning(obs: Observed, m: SlotMeaning, slot: ir.Slot) -> None:
+    """Effects the video AI names that no measurement found at that time (glow, glitch, scanlines ...)."""
+    from ..render import capabilities
+
+    for x in m.effects:
+        kind = x["type"] if x["type"] in get_args(ir.EffectType) else "other"
+        conf = min(1.0, max(0.0, float(x.get("confidence") or 0.5)))
+        try:
+            a = slot.start + ir.s2f(float(x.get("start_s") or 0))
+            b = slot.start + ir.s2f(float(x.get("end_s") or 0))
+        except (TypeError, ValueError):
+            continue
+        a, b = max(slot.start, a), min(slot.end, max(b, a + 1))
+        if conf < AI_EFFECT_CONF or kind in ("shake", "zoom_punch") or b <= a:  # those two the camera track measures
+            continue
+        if any(e.type.value == kind and e.start < b and e.end > a for e in obs.effects):
+            continue  # measured already: the measurement owns its timing
+        render, loss = capabilities.effect(kind)
+        obs.effects.append(ir.Effect(id=f"e{len(obs.effects) + 1:02d}", start=a, end=b, render=render, loss=loss,
+                                     type=F[ir.EffectType](value=kind, raw=x, conf=conf * UNMEASURED_FACTOR,
+                                                           source=m.provider)))

@@ -34,7 +34,17 @@ Sorted by priority (P0 first). Each item follows the same fields.
 
 ---
 
-### PERF-1 — Run label/OCR analysis on the GPU
+### TREND-1 — Check the trend-style detectors on real reels
+- **Priority:** P1
+- **Category:** Accuracy & Testing
+- **Description:** The trend-style work (plan: `C:\Users\kiran\.claude\plans\sparkling-inventing-quill.md`) added new tracks (`tiles`, `masks`, `match_cuts`), shake windows and zoom punches (camera v4), word reveal / highlight and rotation (text v8), bounce (text_anim v6), glitch (effects v3), and video-AI fields (meaning prompt v4: reverse, effects, tiles, match cut, 3D tilt). All thresholds are guesses tested on synthetic data only. Label the optional fields in `gold/README.md` on reels that show them, then run `tools.score` and tune `camera.SHAKE_MIN/PUNCH_MIN`, `match_cuts.EDGE_MATCH/COLOUR_CHANGE`, `masks.MIN_BG`, `text.LIT`.
+- **Open checks:** (1) small captions at `OCR_LONG = 640` on a 1080×1920 reel; (2) one live video-AI call so reverse / effects / tilt / match-cut answers are proven; (3) a rendered HyperFrames spin / zoom-out / glitch transition looked at by eye; (4) grain and scanlines are named by the video AI only (the 160 px analysis width cannot see them).
+- **Dependencies:** GOLD-1 labels with the optional fields.
+- **Found via:** trend-style gap plan (2026-11-14).
+
+---
+
+### PERF-1 — Run label/OCR analysis on the GPU — DONE 2026-11-13: text track 382 s → 39 s cold on reel13 (full label ~42 s); GPU path in `evidence/text.py` with CPU fallback; requirements pin `onnxruntime-gpu[cuda,cudnn]`
 - **Priority:** P1
 - **Category:** Performance
 - **Description:** `tools.label` takes about 1–5 minutes per reel, and the GPU (RTX 2050, 4 GB) sat idle at 0% use. The installed `onnxruntime` 1.31.1 is the CPU-only build (providers: `AzureExecutionProvider`, `CPUExecutionProvider`). Replace it with `onnxruntime-gpu`, install the matching CUDA/cuDNN libraries, and turn on CUDA in the RapidOCR settings in `backend/app/evidence/text.py:37`. Time one reel before and after. Profile first to confirm OCR is the bottleneck, since that is not yet measured.
@@ -49,7 +59,7 @@ Sorted by priority (P0 first). Each item follows the same fields.
 
 ---
 
-### GOLD-3 — Decide what `gold/shots/` is and tidy `gold/reels/`
+### GOLD-3 — Decide what `gold/shots/` is and tidy `gold/reels/` — DONE 2026-11-13: moved to `gold/footage/` (documented in README), empty `gold/reels/` removed
 - **Priority:** P2
 - **Category:** Cleanup
 - **Description:** `gold/shots/` holds 7 loose clips (`450w-*.mp4`, `document_810w-*.mp4`) that are not in the per-reel layout. `gold/reels/` is now empty because the 13 reels were moved into `gold/reelNN/`. Decide whether the clips are footage for matching or leftovers, then keep, move or delete them, and remove the empty `gold/reels/` folder.

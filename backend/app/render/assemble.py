@@ -30,6 +30,32 @@ def _audio_args(plan: Plan, n_frames: int) -> tuple[list[str], list[str]]:
     return ["-f", "lavfi", "-t", secs, "-i", "anullsrc=r=48000:cl=stereo"], ["-map", "1:a:0"]
 
 
+FULL_FRAME = 0.05  # a layer clip within this of the frame's aspect is a full-frame cut-out, drawn at 0,0
+
+
+def layer_overlay(base: str, idx: int, c: dict, label: str) -> str:
+    """A supplied layer clip (alpha kept) over base from its start frame, moving from its first to its last key."""
+    from ..clients import ff as ff_
+
+    keys = sorted(c["keys"], key=lambda k: k["frame"])
+    v = ff_.video_stream(ff_.probe(c["path"]))
+    full = abs(int(v["width"]) / max(1, int(v["height"])) - config.W / config.H) < FULL_FRAME and \
+        keys[0]["box"]["w"] > 0.5
+    k0, k1 = keys[0], keys[-1]
+    t0, t1 = k0["frame"] / FPS, max(k0["frame"] + 1, k1["frame"]) / FPS
+    if full:
+        size, x, y = f"{config.W}:{config.H}", "0", "0"
+    else:
+        b0, b1 = k0["box"], k1["box"]
+        size = f"{max(2, round(b0['w'] * config.W / 2) * 2)}:{max(2, round(b0['h'] * config.H / 2) * 2)}"
+        p = f"clip((t-{t0:.4f})/{t1 - t0:.4f},0,1)"
+        x = f"{b0['x'] * config.W:.1f}+({(b1['x'] - b0['x']) * config.W:.1f})*{p}"
+        y = f"{b0['y'] * config.H:.1f}+({(b1['y'] - b0['y']) * config.H:.1f})*{p}"
+    return (f"[{idx}:v]format=yuva420p,scale={size},setpts=PTS-STARTPTS+{c['start'] / FPS:.4f}/TB[c{label}];"
+            f"{base}[c{label}]overlay=x='{x}':y='{y}':eval=frame:eof_action=pass:"
+            f"enable='between(n,{c['start']},{c['end'] - 1})'[{label}]")
+
+
 def assemble(plan: Plan, clips: list[Path], workdir: Path, out: Path) -> float:
     """Returns the planned length in seconds (n_frames / FPS)."""
     from ..stages import editor
@@ -68,7 +94,7 @@ def assemble(plan: Plan, clips: list[Path], workdir: Path, out: Path) -> float:
             layer = overlay.pick("overlay").render(overlay.OverlaySpec(n, engine_texts, images), tmp / "layer.webm")
         lib_texts = [e for e in plan.texts if not overlay.needs_engine(e)]
         if lib_texts:
-            doc, _losses = textlayer.ass(lib_texts)
+            doc, _losses = textlayer.ass(lib_texts)  # losses reach the user on the template card (main._template_report)
         elif plan.captions and any(s.caption.strip() for s in plan.shots):
             doc = editor._ass(plan, starts(plan))
         vf = [f for f in (capabilities.effect_filter(e) for e in plan.effects) if f]
@@ -81,15 +107,32 @@ def assemble(plan: Plan, clips: list[Path], workdir: Path, out: Path) -> float:
         if doc:
             (tmp / "captions.ass").write_text(doc, encoding="utf-8")
             vf.append("subtitles=captions.ass")
-        if layer:  # composite under the libass text and effects; input 2 after the soundtrack
-            ins += ["-c:v", "libvpx-vp9", "-i", str(layer.resolve())]
-            chain = ",".join(vf) or "null"
-            vargs = ["-filter_complex", f"[0:v][2:v]overlay=0:0:eof_action=pass,{chain}[vout]", "-c:v", "libx264",
-                     "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]
+        if layer or plan.layer_clips:  # one graph: engine layer, layer clips under / over the text
+            graph, cur, nxt = [], "0:v", 2
+            if layer:  # composite under the libass text and effects; input 2 after the soundtrack
+                ins += ["-c:v", "libvpx-vp9", "-i", str(layer.resolve())]
+                graph.append("[0:v][2:v]overlay=0:0:eof_action=pass[b0]")
+                cur, nxt = "b0", 3
+            below = [c for c in plan.layer_clips if not c.get("above_text")]
+            above = [c for c in plan.layer_clips if c.get("above_text")]
+            for k, c in enumerate(below + above):
+                ins += [*(["-c:v", "libvpx-vp9"] if Path(c["path"]).suffix.lower() == ".webm" else []),
+                        "-i", str(Path(c["path"]).resolve())]
+            for k, c in enumerate(below):
+                graph.append(layer_overlay(f"[{cur}]", nxt + k, c, f"lb{k}"))
+                cur = f"lb{k}"
+            graph.append(f"[{cur}]{','.join(vf) or 'null'}[mid]")
+            cur = "mid"
+            for k, c in enumerate(above):
+                graph.append(layer_overlay(f"[{cur}]", nxt + len(below) + k, c, f"la{k}"))
+                cur = f"la{k}"
+            graph.append(f"[{cur}]null[vout]")
+            vargs = ["-filter_complex", ";".join(graph), *enc]
         elif vf:
-            vargs = ["-vf", ",".join(vf), "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]
+            vargs = ["-vf", ",".join(vf), *enc]
         # cwd=tmp so the subtitles filter sees a bare file name (no C:\ escaping)
-        vmap = ["-map", "[vout]"] if layer else ["-map", "0:v:0"]
+        vmap = ["-map", "[vout]"] if layer or plan.layer_clips else ["-map", "0:v:0"]
         ff.run(["-i", str(body.resolve()), *ins, *vmap, *aargs, *vargs, "-frames:v", str(n),
                 "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest", str((tmp / "final.mp4").resolve())], cwd=tmp)
         shutil.copy2(tmp / "final.mp4", out)

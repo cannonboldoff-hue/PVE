@@ -118,4 +118,5 @@ def test_video_ai_layers_become_low_confidence_layers_with_a_loss():
     a, b, c = t.layers
     assert (a.kind.value, a.shape, a.kind.conf, len(a.keys)) == ("shape_mask", "circle", fusion.LAYER_CONF, 1)
     assert [k.frame for k in b.keys] == [0, 44] and b.keys[1].box.x == 0.5 and c.kind.value == "other"
-    assert all(x.loss for x in t.layers)
+    assert a.render == "ffmpeg:geq" and not a.loss  # a circle shape mask is drawn
+    assert all(x.loss for x in t.layers if x.kind.value != "shape_mask")

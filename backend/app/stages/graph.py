@@ -37,6 +37,10 @@ def compile_plan(plan: Plan) -> list[Node]:
             p |= {"frames": s.frames, "lead": s.lead, "tail": s.tail, "speed_curve": s.speed_curve,
                   "reverse": s.reverse, "freeze": s.freeze, "camera_path": s.camera_path, "shake": s.shake,
                   "layout_boxes": s.layout_boxes, "colour": s.colour}
+            if s.tile_params:  # only when set, so earlier renders keep their hashes
+                p["tile_params"] = s.tile_params
+            if s.mask:
+                p["mask"] = s.mask
         n = Node(f"prep_clip[{s.shot_id}]", "prep", {**p, "path": s.path, "tile_paths": s.tiles})
         n.hash = _h(p)
         nodes.append(n)
@@ -59,6 +63,8 @@ def compile_plan(plan: Plan) -> list[Node]:
     if plan.n_frames is not None:
         ap |= {"n_frames": plan.n_frames, "frames": [s.frames for s in plan.shots], "audio_mode": plan.audio_mode,
                "transitions_ir": plan.transitions, "effects": plan.effects, "texts": plan.texts, "overlays": plan.overlays}
+        if plan.layer_clips:
+            ap["layer_clips"] = [{**c, "src": _file_id(c["path"])} for c in plan.layer_clips]
     a = Node("assemble", "assemble", {**ap, "music_path": plan.music_path}, [n.id for n in preps + trans])
     a.hash = _h(ap)
     nodes.append(a)

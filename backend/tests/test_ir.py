@@ -56,3 +56,66 @@ def test_db_migration_adds_columns_once():
     cols = {r["name"] for r in db.q("PRAGMA table_info(templates)")}
     assert {"template", "delta", "ir_version"} <= cols
     assert {r["name"] for r in db.q("PRAGMA table_info(refs)")} >= {"key", "validated", "proxy_path"}
+
+
+def _lossy(t: ir.Template) -> dict:
+    """What compact() is allowed to forget: engine output, provenance, logs; floats to 4 places."""
+    d = ir.compact(ir.expand(ir.compact(t)))
+    return d
+
+
+def test_compact_round_trips_and_shrinks():
+    t = _template()
+    c = ir.compact(t)
+    assert "unsupported" not in c and "loss" not in c["transitions"][0]
+    assert c["slots"][1]["media"] == "photo" and c["effects"][0]["type"] == "flash"
+    assert c["transitions"][0]["type"] == {"v": "other", "raw": "ink bleed"}  # "other" keeps its raw
+    assert c["texts"][0]["text"] == {"v": "Hi", "binding": "swap"}  # raw == value is dropped
+    assert _lossy(t) == c  # expand(compact(x)) compacts to the same thing
+    e = ir.expand(c)
+    assert e.cuts() == t.cuts() and e.slots[0].speed == t.slots[0].speed and e.texts[0].keys == t.texts[0].keys
+    assert len(json.dumps(c)) < len(t.model_dump_json()) / 2
+
+
+def test_compact_keys_keep_holds_and_motion():
+    box = ir.Box(x=0.1, y=0.2, w=0.3, h=0.1)
+    moved = ir.Box(x=0.5, y=0.2, w=0.3, h=0.1)
+    keys = [ir.Key(frame=f, box=box) for f in (0, 0, 4, 8, 12)] + [ir.Key(frame=20, box=moved)]
+    t = _template()
+    t.texts[0].keys = keys
+    out = ir.compact(t)["texts"][0]["keys"]
+    assert [k[0] for k in out] == [0, 12, 20]  # hold ends at 12, move starts there
+
+
+def test_compact_drops_empties_but_keeps_meaningful_nulls():
+    t = _template()
+    t.effects[0].params = {"layer": "BG", "params": {"Map": {"value": 3.0}, "Dir": {"keys": []}}, "x": None}
+    t.texts[0].style.outline = None  # no outline; the default is black
+    c = ir.compact(t)
+    assert c["effects"][0]["params"] == {"layer": "BG", "params": {"Map": {"value": 3.0}}}  # a free dict is not an F
+    e = ir.expand(c)
+    assert e.texts[0].style.outline is None and e.effects[0].params["params"]["Map"] == {"value": 3.0}
+
+
+def test_compact_hoists_the_effect_app():
+    t = _template()
+    raw = {"app": "after_effects", "match": "ADBE Fill", "name": "Fill"}
+    t.effects = [ir.Effect(id=f"e{i}", type=ir.F[ir.EffectType](value="other", raw=dict(raw)), start=0, end=9)
+                 for i in range(2)]
+    c = ir.compact(t)
+    assert c["app"] == "after_effects" and "app" not in c["effects"][0]["type"]["raw"]
+    assert ir.expand(c).effects[1].type.raw == raw
+    t.effects[1].type.raw["app"] = "premiere"  # mixed apps stay where they are
+    assert "app" not in ir.compact(t) and ir.compact(t)["effects"][0]["type"]["raw"]["app"] == "after_effects"
+
+
+def test_compact_keys_are_arrays_and_straight_runs_collapse():
+    keys = [ir.Key(frame=f, box=ir.Box(x=0.1 + f * 0.01, y=0.2, w=0.3, h=0.1), opacity=1.0 if f < 8 else 0.5)
+            for f in range(0, 11)]
+    t = _template()
+    t.texts[0].keys = keys
+    out = ir.compact(t)["texts"][0]["keys"]
+    assert out[0] == [0, 0.1, 0.2, 0.3, 0.1] and out[-1][5:] == [1.0, 0.0, 0.5]  # trailing defaults trimmed
+    assert [k[0] for k in out] == [0, 7, 8, 10]  # line, then the opacity step, then the line again
+    e = ir.expand(ir.compact(t)).texts[0].keys
+    assert e[1] == ir.Key(frame=7, box=ir.Box(x=0.17, y=0.2, w=0.3, h=0.1))

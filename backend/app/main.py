@@ -147,7 +147,14 @@ def _template_report(p: dict) -> dict | None:
             obj = obj[int(part)] if part.isdigit() else obj[part]
         return obj
 
+    from .render import overlay
+
     losses = [x["loss"] for x in t["transitions"] + t["effects"] + t.get("layers", []) if x.get("loss")]
+    for e in t.get("texts", []):  # what the text renderer (libass or the overlay engine) cannot draw
+        try:
+            losses += [f"text {e['id']}: {x}" for x in overlay.text_losses(e)]
+        except (KeyError, TypeError):
+            continue
     confirm = []
     for path in t.get("low_conf", []):
         try:
@@ -155,8 +162,9 @@ def _template_report(p: dict) -> dict | None:
             confirm.append({"path": path, "value": f["value"], "note": f.get("raw"), "conf": f.get("conf")})
         except (KeyError, IndexError, ValueError, TypeError):
             continue
+    shot_list = [x for s in t.get("slots", []) for x in ((s.get("requirement") or {}).get("instructions") or [])]
     return {"delta": row.get("delta"), "losses": sorted(set(losses)), "confirm": confirm,
-            "omissions": t.get("narrative", {}).get("omissions", [])}
+            "omissions": t.get("narrative", {}).get("omissions", []), "shot_list": shot_list}
 
 
 class Changes(BaseModel):

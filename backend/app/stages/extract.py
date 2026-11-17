@@ -8,7 +8,8 @@ from ..ir import Template
 from ..models import ShotSpec
 from .fusion import Observed
 
-VERSION = 3  # 3: text events (M4); 2: built from Observed (typed meaning, M3); 1: cut-only (M2)
+VERSION = 4  # 4: trend styles (tiles, shake windows, words, layers, match cuts); 3: text events (M4); 2: typed
+# meaning (M3); 1: cut-only (M2)
 SWAP_FIELDS = ("subject", "action")  # content: rewritten for the new reel; everything else is structure (keep)
 MULTI_LAYOUTS = ("split_v", "split_h", "pip", "collage")  # layouts that take one clip per box
 CONF_ASK = 0.5  # fields below this go to template.low_conf for a user confirm
@@ -36,7 +37,7 @@ def build(obs: Observed, audio: str = "") -> Template:
                     effects=[e.model_copy(deep=True) for e in obs.effects],
                     overlays=[o.model_copy(deep=True) for o in obs.overlays],
                     layers=[x.model_copy(deep=True) for x in obs.layers],
-                    narrative=dict(obs.narrative), low_conf=low)
+                    narrative=dict(obs.narrative), low_conf=low, dropped=dict(obs.dropped))
 
 
 def slot_index(t: Template, frame: int) -> int:
@@ -47,8 +48,10 @@ def slot_texts(t: Template) -> list[list[dict]]:
     """Per slot, the text events that start in it: [{id, role, original, max_chars}] (what the fill step rewrites)."""
     out: list[list[dict]] = [[] for _ in t.slots]
     for e in t.texts:
-        out[slot_index(t, e.start)].append({"id": e.id, "role": e.role.value, "original": e.text.raw or e.text.value,
-                                            "max_chars": e.max_chars})
+        d = {"id": e.id, "role": e.role.value, "original": e.text.raw or e.text.value, "max_chars": e.max_chars}
+        if e.highlight and e.anim_in.value != "word_highlight":  # the reference colours its key words
+            d["highlighted_words"] = [w.i for w in e.words]
+        out[slot_index(t, e.start)].append(d)
     return out
 
 
@@ -67,6 +70,8 @@ def to_shotspecs(t: Template, legacy_fields: list[dict]) -> list[ShotSpec]:
         s.setdefault("subject", slot.subject.value)
         s.setdefault("action", slot.action.value)
         s.setdefault("camera", slot.angle.value)
+        if slot.requirement and slot.requirement.instructions:  # the template's shot list (match cuts, boxes, cut-outs)
+            s.setdefault("direction", "; ".join(slot.requirement.instructions))
         multi = slot.layout.value in MULTI_LAYOUTS and len(slot.layout_boxes) > 1
         s["layout"] = "collage" if multi else s.get("layout", "single")  # the match step finds a clip per box
         if multi:

@@ -2,6 +2,22 @@
 
 Upload or link a reference Reel. The system measures it, builds a reusable template, proves the template by rendering it back, works out what footage each slot needs, matches your own clips, renders a new Reel with the same structure and the reference's own audio, and reports the difference.
 
+## Where the project is going
+The shipped MVP uses hand-built detectors and a video AI. The next track replaces them with a model: a frame gate drops unchanged frames, a fine-tuned Qwen3-VL reads the rest and returns one template JSON (`backend/app/ir.py`), and a converter builds an editable FilmCraft / EffectCraft project with a solid-colour canvas per slot. A checkpoint replaces today's prompting only if it scores higher on the gold reels. Architecture page: https://claude.ai/artifact/TAGSMnSadw1oRCTHZBRm7y
+
+## Docs
+| File | What it holds |
+|---|---|
+| [`docs/PRD.md`](docs/PRD.md) | goals, requirements, model plan, open items |
+| [`docs/App-Flow.md`](docs/App-Flow.md) | project states and the step-by-step flow |
+| [`docs/Backend-Schema.md`](docs/Backend-Schema.md) | SQLite tables, IR files, models |
+| [`docs/Security.md`](docs/Security.md) | threats, controls, legal notes |
+| [`docs/UI-UX-Brief.md`](docs/UI-UX-Brief.md) | chat UI, cards, accessibility |
+| [`docs/Implementation-Plan.md`](docs/Implementation-Plan.md) | next milestones |
+| [`docs/mvp-plan.md`](docs/mvp-plan.md) | the shipped M0 to M12 build and decisions log |
+| [`CLAUDE.md`](CLAUDE.md) | rules for Claude working in this repo |
+| [`TODO.md`](TODO.md) | prioritised tasks |
+
 ## Setup
 1. Install FFmpeg with libass: `winget install Gyan.FFmpeg`. Node 22+ for the overlay engine.
 2. `copy .env.example .env` and fill the keys (below).

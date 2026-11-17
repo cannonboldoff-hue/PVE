@@ -110,6 +110,7 @@ class ShotContent(BaseModel):
 class TextFill(BaseModel):
     id: str
     text: str
+    key_words: list[int] = Field(default_factory=list, description="0-based indices of the words to highlight")
 
 
 class ShotContentList(BaseModel):
@@ -154,8 +155,10 @@ class PlanShot(BaseModel):
     reverse: bool = False
     freeze: list[tuple[int, int]] = Field(default_factory=list)
     camera_path: list[dict] = Field(default_factory=list)  # ir.Key dicts, frames relative to the slot start
-    shake: dict | None = None  # {amp, hz}
+    shake: dict | list[dict] | None = None  # {amp, hz} for the whole slot, or windows [{start, end, amp, hz}]
     layout_boxes: list[dict] = Field(default_factory=list)
+    tile_params: list[dict] = Field(default_factory=list)  # per box: own speed_curve, freeze, reverse, camera_path, shake
+    mask: dict | None = None  # shape mask: {shape, bg, keys: [{frame (slot-relative), box}]}
     colour: dict | None = None
 
     @property
@@ -176,6 +179,8 @@ class Plan(BaseModel):
     effects: list[dict] = Field(default_factory=list)
     texts: list[dict] = Field(default_factory=list)
     overlays: list[dict] = Field(default_factory=list)
+    # supplied cut-out / moving layer clips: {path, start, end (absolute frames), keys: [{frame, box}], above_text}
+    layer_clips: list[dict] = Field(default_factory=list)
     audio_mode: Literal["legacy", "reference"] = "legacy"
 
 
